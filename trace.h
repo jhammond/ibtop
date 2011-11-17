@@ -1,9 +1,11 @@
 #ifndef _TRACE_H_
 #define _TRACE_H_
-#define _GNU_SOURCE
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 
 #ifdef DEBUG
 #define TRACE ERROR

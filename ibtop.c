@@ -12,26 +12,50 @@
 
 int main(int argc, char *argv[])
 {
-  const char *hca_name = "mlx4_0";
+  /* /sys/class/infiniband/HCA_NAME/ports/HCA_PORT */
+
+  char *hca_name = "mlx4_0";
   int hca_port = 1;
   int sw_lid = -1, sw_port = -1;
 
-  struct ibmad_port *mad_port = NULL;
-  int mad_fd = -1;
+  int umad_fd = -1; /* umad_fd */
+  int umad_agent_id = -1;
+
   int mad_timeout = 15;
-  int mad_classes[] = { IB_PERFORMANCE_CLASS, };
-  int nr_mad_classes = sizeof(mad_classes) / sizeof(mad_classes[0]);
   int mad_timeout_ms = 1000 * mad_timeout;
+  int mad_retries = 10;
 
-  /* /sys/class/infiniband/HCA_NAME/ports/HCA_PORT */
-
-  mad_port = mad_rpc_open_port(hca_name, hca_port, mad_classes, nr_mad_classes);
-  if (mad_port == NULL) {
-    ERROR("cannot open MAD port for HCA `%s' port %d\n", hca_name, hca_port);
+  if (umad_init() < 0) {
+    ERROR("cannot init libibumad: %m\n");
     goto out;
   }
 
-  mad_fd = mad_port->port_id;
+  umad_fd = umad_open_port(hca_name, hca_port);
+  if (umad_fd < 0) {
+    ERROR("cannot open umad port: %m\n");
+    goto out;
+  }
+
+  /* mad_register_client_via(mgmt, rmpp_version, p); */
+  /* rmpp_version = 0 */
+  /* mad_register_port_client(mad_fd, mgmt, rmpp_version); */
+  /* vers = mgmt_class_vers(mgmt)  = 1*/
+
+  umad_agent_id = umad_register(umad_fd, IB_PERFORMANCE_CLASS, 1, 0, 0);
+  if (umad_agent_id < 0) {
+    ERROR("cannot register umad agent: %m\n");
+    goto out;
+  }
+
+  // int mad_classes[] = { IB_PERFORMANCE_CLASS, };
+  // int nr_mad_classes = sizeof(mad_classes) / sizeof(mad_classes[0]);
+
+  // mad_port = mad_rpc_open_port(hca_name, hca_port, mad_classes, nr_mad_classes);
+  // if (mad_port == NULL) {
+  // ERROR("cannot open MAD port for HCA `%s' port %d\n", hca_name, hca_port);
+  // goto out;
+  // }
+  // mad_fd = mad_port->port_id;
 
 #ifdef CALL_PMA_QUERY_VIA
   ib_portid_t sw_id = {
@@ -75,7 +99,7 @@ int main(int argc, char *argv[])
   memset(r_buf, 0, sizeof(r_buf));
 
   struct ib_user_mad *su = (struct ib_user_mad *) s_buf;
-  su->agent_id = mad_port->class_agents[IB_PERFORMANCE_CLASS];
+  su->agent_id = umad_agent_id;
   su->timeout_ms = mad_timeout_ms;
   su->retries = mad_retries;
   /* length? */
@@ -98,7 +122,7 @@ int main(int argc, char *argv[])
   mad_set_field(sm, 0, IB_MAD_ATTRMOD_F, 0 /* rpc->attr.mod */);
   mad_set_field64(sm, 0, IB_MAD_MKEY_F, 0 /* rpc->mkey */);
 
-  void *s_data = (char *) sm + IB_PC_DATA_OFFS; 
+  void *s_data = (char *) sm + IB_PC_DATA_OFFS;
   mad_set_field(s_data, 0, IB_PC_PORT_SELECT_F, sw_port);
 
   /* memcpy(mad + IB_PC_DATA_OFFS, sw_pma_buf, IB_PC_DATA_SZ); */
@@ -114,23 +138,19 @@ int main(int argc, char *argv[])
   // ((struct ib_user_mad *) umad)->retries = mad_retries;
   // ((struct ib_user_mad *) umad)->agent_id = mad_agent_id;
 
-  ssize_t ns = write(mad_fd, su, umad_size() + IB_MAD_SIZE);
-  if (ns < 0) {
+  ssize_t nw = write(umad_fd, su, umad_size() + IB_MAD_SIZE);
+  if (nw < 0) { /* ... */
     ERROR("cannot send mad: %m\n");
     goto out;
   }
 
   struct pollfd fds = {
-    .fd = mad_fd, 
+    .fd = umad_fd,
     .events = POLLIN,
   };
 
-  struct timespec poll_ts = {
-    .tv_sec = timeout,
-  };
-
   while (1) {
-    int np = ppoll(&fds, 1, &poll_ts, NULL);
+    int np = poll(&fds, 1, mad_timeout_ms);
     if (np < 0) {
       ERROR("error polling for mads: %m\n");
       goto out;
@@ -139,10 +159,10 @@ int main(int argc, char *argv[])
       goto out;
     }
 
-    ssize_t nr = read(mad_fd, r_buf, sizeof(r_buf));
+    ssize_t nr = read(umad_fd, r_buf, sizeof(r_buf));
     if (nr < 0) {
       if (errno == EWOULDBLOCK)
-	continue;
+        continue;
       ERROR("error receiving mad: %m\n");
       goto out;
     }
@@ -172,8 +192,8 @@ int main(int argc, char *argv[])
         sw_rx_bytes, sw_rx_packets, sw_tx_bytes, sw_tx_packets);
 
  out:
-  if (mad_port != NULL)
-    mad_rpc_close_port(mad_port);
+  if (umad_fd >= 0)
+    umad_close_port(umad_fd);
 
   return 0;
 }
