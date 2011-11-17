@@ -16,7 +16,8 @@ int main(int argc, char *argv[])
 
   char *hca_name = "mlx4_0";
   int hca_port = 1;
-  int sw_lid = -1, sw_port = -1;
+  int sw_lid = 3229;
+  int sw_port = 9;
 
   int umad_fd = -1; /* umad_fd */
   int umad_agent_id = -1;
@@ -24,6 +25,8 @@ int main(int argc, char *argv[])
   int mad_timeout = 15;
   int mad_timeout_ms = 1000 * mad_timeout;
   int mad_retries = 10;
+
+  umad_debug(9);
 
   if (umad_init() < 0) {
     ERROR("cannot init libibumad: %m\n");
@@ -56,6 +59,9 @@ int main(int argc, char *argv[])
   // goto out;
   // }
   // mad_fd = mad_port->port_id;
+
+  /* XXX qkey 0x80010000 */
+
 
 #ifdef CALL_PMA_QUERY_VIA
   ib_portid_t sw_id = {
@@ -103,9 +109,10 @@ int main(int argc, char *argv[])
   su->timeout_ms = mad_timeout_ms;
   su->retries = mad_retries;
   /* length? */
-  su->addr.qpn = 1;
-  su->addr.qkey = IB_DEFAULT_QP1_QKEY;
-  su->addr.lid = sw_lid;
+  umad_set_addr(su, sw_lid, 1, 0, IB_DEFAULT_QP1_QKEY);
+  // su->addr.qpn = 1;
+  // su->addr.qkey = IB_DEFAULT_QP1_QKEY;
+  // su->addr.lid = sw_lid;
 
   void *sm = umad_get_mad(su);
   /* char *p = mad_encode(mad, &sw_pma_rpc, 0, sw_pma_buf); */
@@ -149,6 +156,8 @@ int main(int argc, char *argv[])
     .events = POLLIN,
   };
 
+  /* TODO Fixup timeout. */
+
   while (1) {
     int np = poll(&fds, 1, mad_timeout_ms);
     if (np < 0) {
@@ -166,14 +175,15 @@ int main(int argc, char *argv[])
       ERROR("error receiving mad: %m\n");
       goto out;
     }
+
+    break;
   }
 
   struct ib_user_mad *ru = (struct ib_user_mad *) r_buf;
   TRACE("ru status %d\n", ru->status);
   void *rm = umad_get_mad(ru);
   uint64_t r_trid = mad_get_field64(rm, 0, IB_MAD_TRID_F);
-  TRACE("r_trid %lu\n", (unsigned long) r_trid);
-
+  TRACE("s_trid %lx, r_trid %lx\n", (unsigned long) s_trid, (unsigned long) r_trid);
 
   if (mad_get_field(rm, 0, IB_DRSMP_STATUS_F) == IB_MAD_STS_REDIRECT) {
     ERROR("received redirect\n");
