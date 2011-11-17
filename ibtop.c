@@ -22,9 +22,8 @@ int main(int argc, char *argv[])
   int umad_fd = -1; /* umad_fd */
   int umad_agent_id = -1;
 
-  int mad_timeout = 15;
-  int mad_timeout_ms = 1000 * mad_timeout;
-  int mad_retries = 10;
+  int mad_timeout_ms = 15;
+  // int mad_retries = 10;
 
   umad_debug(9);
 
@@ -50,34 +49,7 @@ int main(int argc, char *argv[])
     goto out;
   }
 
-  // int mad_classes[] = { IB_PERFORMANCE_CLASS, };
-  // int nr_mad_classes = sizeof(mad_classes) / sizeof(mad_classes[0]);
-
-  // mad_port = mad_rpc_open_port(hca_name, hca_port, mad_classes, nr_mad_classes);
-  // if (mad_port == NULL) {
-  // ERROR("cannot open MAD port for HCA `%s' port %d\n", hca_name, hca_port);
-  // goto out;
-  // }
-  // mad_fd = mad_port->port_id;
-
   /* XXX qkey 0x80010000 */
-
-
-#ifdef CALL_PMA_QUERY_VIA
-  ib_portid_t sw_id = {
-    .lid = sw_lid
-    .qp = 1,
-    .qkey = IB_DEFAULT_QP1_QKEY,
-  };
-
-  char sw_pma_buf[1024];
-
-  if (pma_query_via(sw_pma_buf, &sw_id, sw_port, mad_timeout,
-		    IB_GSI_PORT_COUNTERS_EXT, mad_port) == NULL) {
-    ERROR("cannot query performance counters of switch LID %d, port %d: %m\n", sw_lid, sw_port);
-    goto out;
-  }
-#endif
 
 #ifdef CALL_MAD_RPC
   ib_rpc_t sw_pma_rpc = {
@@ -105,25 +77,17 @@ int main(int argc, char *argv[])
   memset(r_buf, 0, sizeof(r_buf));
 
   struct ib_user_mad *su = (struct ib_user_mad *) s_buf;
-  su->agent_id = umad_agent_id;
-  su->timeout_ms = mad_timeout_ms;
-  su->retries = mad_retries;
-  /* length? */
-  umad_set_addr(su, sw_lid, 1, 0, IB_DEFAULT_QP1_QKEY);
-  // su->addr.qpn = 1;
-  // su->addr.qkey = IB_DEFAULT_QP1_QKEY;
-  // su->addr.lid = sw_lid;
 
   void *sm = umad_get_mad(su);
   /* char *p = mad_encode(mad, &sw_pma_rpc, 0, sw_pma_buf); */
 
   mad_set_field(sm, 0, IB_MAD_METHOD_F, IB_MAD_METHOD_GET);
   mad_set_field(sm, 0, IB_MAD_RESPONSE_F, 0);
-  mad_set_field(sm, 0, IB_MAD_CLASSVER_F, 2);
+  mad_set_field(sm, 0, IB_MAD_CLASSVER_F, 1);
   mad_set_field(sm, 0, IB_MAD_MGMTCLASS_F, IB_PERFORMANCE_CLASS);
   mad_set_field(sm, 0, IB_MAD_BASEVER_F, 1);
 
-  mad_set_field(sm, 0, IB_MAD_STATUS_F, 0 /* rpc->rstatus */);
+  // mad_set_field(sm, 0, IB_MAD_STATUS_F, 0 /* rpc->rstatus */);
   mad_set_field64(sm, 0, IB_MAD_TRID_F, s_trid);
   mad_set_field(sm, 0, IB_MAD_ATTRID_F, IB_GSI_PORT_COUNTERS_EXT);
   mad_set_field(sm, 0, IB_MAD_ATTRMOD_F, 0 /* rpc->attr.mod */);
@@ -144,6 +108,15 @@ int main(int argc, char *argv[])
   // ((struct ib_user_mad *) umad)->timeout_ms = mad_timeout_ms;
   // ((struct ib_user_mad *) umad)->retries = mad_retries;
   // ((struct ib_user_mad *) umad)->agent_id = mad_agent_id;
+
+  umad_set_addr(su, sw_lid, 1, 0, IB_DEFAULT_QP1_QKEY);
+  su->agent_id = umad_agent_id;
+  su->timeout_ms = mad_timeout_ms;
+  // su->retries = mad_retries;
+  /* length? */
+  // su->addr.qpn = 1;
+  // su->addr.qkey = IB_DEFAULT_QP1_QKEY;
+  // su->addr.lid = sw_lid;
 
   ssize_t nw = write(umad_fd, su, umad_size() + IB_MAD_SIZE);
   if (nw < 0) { /* ... */
