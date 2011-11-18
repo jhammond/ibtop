@@ -109,6 +109,27 @@ int host_send_perf_umad(struct host_ent *h)
   return 0;
 }
 
+static inline void dump_umad(void *um, size_t len)
+{
+#ifdef DEBUG
+  unsigned char *p = um;
+  unsigned int i, j;
+
+  TRACE("umad dump, len %zu\n", len);
+
+  for (i = 0; i < len; i += 16) {
+    fprintf(stderr, "%4u", i);
+    for (j = i; j < i + 16 && j < len; j++) {
+      if (p[j] != 0)
+        fprintf(stderr, " %02hhx", p[j]);
+      else
+        fprintf(stderr, " --");
+    }
+    fprintf(stderr, "\n");
+  }
+#endif
+}
+
 int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
 {
   char buf[1024];
@@ -124,6 +145,8 @@ int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
           (size_t) (umad_size() + IB_MAD_SIZE), nr);
     return -1;
   }
+
+  dump_umad(buf, nr);
 
   struct ib_user_mad *um = (struct ib_user_mad *) buf;
   void *m = umad_get_mad(um);
@@ -291,9 +314,7 @@ int main(int argc, char *argv[])
   for (i = 0; i < nr_hosts; i++) {
     if (host_list[i] == NULL)
       continue;
-    if (host_send_perf_umad(host_list[i]) < 0)
-      continue;
-    nr_sent++;
+    /* Aggregate. */
   }
 
   if (ib_net_db != NULL)
