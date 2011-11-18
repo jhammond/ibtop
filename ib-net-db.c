@@ -8,40 +8,65 @@
 #include "ibtop.h"
 #include "gdbm.h"
 
-#define IB_NET_DB_PATH "ib-net.db"
-#define IB_NET_DISC_OUT "ib-net-disc.out"
+#define IB_NET_DISC_OUT "IB_NET_DISC.OUT"
+#define IB_NET_DB_PATH "IB_NET.DB"
 
 void *ib_net_db_open(const char *path, int flags, mode_t mode)
 {
-  GDBM_FILE dbf = NULL;
+  void *db = NULL;
 
   if (path == NULL)
     path = IB_NET_DB_PATH;
 
   /* gdbm runs very slowly on Lustre if you allow it to use a 2M block size. */
-  dbf = gdbm_open((char*) path, 4096, flags, mode, NULL /* fatal_func() */);
-  if (dbf == NULL)
-    ERROR("cannot open ib net db `%s': %s\n", path, gdbm_strerror(gdbm_errno));
+  db = gdbm_open((char*) path, 4096, flags, mode, NULL /* fatal_func() */);
+  if (db == NULL)
+    ERROR("cannot open IB net DB `%s': %s\n", path, gdbm_strerror(gdbm_errno));
 
-  return dbf;
+  return db;
 }
 
-int ib_net_db_store(void *db, const char *ca_name, struct ib_net_ent *ent)
+int ib_net_db_store(void *db, const char *ca, const struct ib_net_ent *ent)
 {
   datum key = {
-    .dptr = (char *) ca_name,
-    .dsize = strlen(ca_name) + 1,
+    .dptr = (char *) ca,
+    .dsize = strlen(ca) + 1,
   }, val = {
     .dptr = (char *) ent,
     .dsize = sizeof(*ent),
   };
 
   if (gdbm_store(db, key, val, GDBM_REPLACE) < 0) {
-    ERROR("cannot store `%s': %s\n", ca_name, gdbm_strerror(gdbm_errno));
+    ERROR("cannot store IB net DB entry for CA `%s': %s\n", ca, gdbm_strerror(gdbm_errno));
     return -1;
   }
 
   return 0;
+}
+
+int ib_net_db_fetch(void *db, const char *ca, struct ib_net_ent *ent)
+{
+  int rc = 0;
+
+  datum key = {
+    .dptr = (char *) ca,
+    .dsize = strlen(ca) + 1,
+  };
+
+  datum val = gdbm_fetch(db, key);
+  if (val.dptr == NULL)
+    goto out; /* Not found. */
+
+  if (val.dsize != sizeof(*ent))
+    FATAL("bad DB entry for CA `%s' size %zu, expected %zu\n",
+          ca, (size_t) val.dsize, sizeof(*ent));
+
+  memcpy(ent, val.dptr, sizeof(*ent));
+  rc = 1;
+ out:
+  free(val.dptr);
+
+  return rc;
 }
 
 /* awk -v RS="\n\n" -v ORS="\n\n" '/i115-308/' current_net.out  */
@@ -79,7 +104,7 @@ int ib_net_db_fill(void *db, FILE *file, const char *path)
     struct ib_net_ent ent;
 
     /* Scan for switch records. */
-    if (sscanf(line, "Switch %*d \"S-%"SCNx64"\" # \"%*[^\"]\" %*s port %*d lid %"SCNx16,
+    if (sscanf(line, "Switch %*d \"S-%"SCNx64"\" # \"%*[^\"]\" %*s port %*d lid %"SCNu16,
                &ent.sw_guid, &ent.sw_lid) != 2)
       continue;
 
@@ -119,18 +144,40 @@ int ib_net_db_fill(void *db, FILE *file, const char *path)
   return rc;
 }
 
-
 int main(int argc, char *argv[])
 {
-  const char *disc_path = argv[1], *db_path = argv[2];
+  const char *disc_path = NULL, *db_path = NULL;
+
+  if (argc > 1)
+    disc_path = argv[1];
+  if (argc > 2)
+    db_path = argv[2];
 
   void *db = ib_net_db_open(db_path, GDBM_NEWDB, 0666);
+  if (db == NULL)
+    exit(EXIT_FAILURE);
 
   int fastmode = 1;
   if (gdbm_setopt(db, GDBM_FASTMODE, &fastmode, sizeof(fastmode)) < 0)
     ERROR("cannot set db to fast mode: %s\n", gdbm_strerror(gdbm_errno));
 
   ib_net_db_fill(db, NULL, disc_path);
+
+  gdbm_sync(db);
+
+
+  const char *ca = "i115-301";
+  struct ib_net_ent ent;
+
+  if (ib_net_db_fetch(db, ca, &ent) > 0)
+    printf("%s "
+           "sw_guid %016"PRIx64", sw_lid %"PRIu16", sw_port %2"PRIu8", "
+           "ca_guid %016"PRIx64", ca_lid %"PRIu16", ca_port %2"PRIu8"\n",
+           ca,
+           ent.sw_guid, ent.sw_lid, ent.sw_port,
+           ent.ca_guid, ent.ca_lid, ent.ca_port);
+  else
+    printf("%s NOT_FOUND\n", ca);
 
   gdbm_close(db);
 
