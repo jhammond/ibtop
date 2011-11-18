@@ -9,8 +9,11 @@
 #include <malloc.h>
 #include <infiniband/umad.h>
 #include <infiniband/mad.h>
+#include <stdint.h>
 #include "string1.h"
 #include "trace.h"
+#include "ibtop.h"
+
 #define HOST_TRID_BASE 0xE1F2A3B4C5D6E7F8
 
 static inline double dnow(void)
@@ -41,7 +44,7 @@ struct host_ent {
   char h_name[];
 };
 
-struct host_ent(const char *name, size_t i)
+struct host_ent *host_ent(void *db, const char *name, size_t i)
 {
   struct host_ent *h;
 
@@ -51,12 +54,14 @@ struct host_ent(const char *name, size_t i)
 
   h->h_trid = HOST_TRID_BASE + i;
 
-  if (ib_net_db_fetch(h->h_name, &h->h_net) <= 0)
+  if (ib_net_db_fetch(db, h->h_name, &h->h_net) <= 0)
     goto err;
+
+  return h;
 
  err:
   free(h);
-  return NULL:
+  return NULL;
 }
 
 int host_send_perf_umad(struct host_ent *h)
@@ -91,7 +96,7 @@ int host_send_perf_umad(struct host_ent *h)
   mad_set_field(pc, 0, IB_PC_PORT_SELECT_F, h->h_net.sw_port);
 
   TRACE("sending host `%s', sw_lid %"PRIu16", sw_port %"PRIu8", trid %"PRIx64"\n",
-        h->h_name, h->h_net.sw_lid, h->h_new.sw_port, h->t_trid);
+        h->h_name, h->h_net.sw_lid, h->h_net.sw_port, h->h_trid);
 
   ssize_t nw = write(umad_fd, um, umad_size() + IB_MAD_SIZE);
   if (nw < 0) {
@@ -148,7 +153,7 @@ int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
   }
 
   TRACE("host `%s', sw_lid %"PRIx16", sw_port %"PRIx8"\n",
-        h->h_name, h->h_ent.sw_lid, h->h_ent.sw_port);
+        h->h_name, h->h_net.sw_lid, h->h_net.sw_port);
 
   void *pc = (char *) m + IB_PC_DATA_OFFS;
   uint64_t sw_rx_b, sw_rx_p, sw_tx_b, sw_tx_p;
@@ -174,6 +179,7 @@ int main(int argc, char *argv[])
   struct host_ent **host_list = NULL;
   size_t nr_hosts = 0, nr_good_hosts = 0, i;
   double delay = 10;
+  void *ib_net_db = NULL;
 
   struct option opts[] = {
     { "delay", 1, NULL, 'd' },
@@ -185,7 +191,7 @@ int main(int argc, char *argv[])
     switch (c) {
     case 'd':
       delay = strtod(optarg, NULL);
-      if (delay <= 0 || delay == HUGE_VAL)
+      if (delay <= 0)
         FATAL("invalid delay `%s'\n", optarg);
       break;
     case '?':
@@ -200,17 +206,21 @@ int main(int argc, char *argv[])
           "Try `%s --help' for more information.",
           program_invocation_short_name);
 
+  ib_net_db = ib_net_db_open(NULL, 0, 0);
+  if (ib_net_db == NULL)
+    FATAL("cannot open IB net DB\n");
+
   nr_hosts = argc - optind;
   host_list = calloc(nr_hosts, sizeof(host_list[0]));
 
   for (i = 0; i < nr_hosts; i++) {
-    host_list[i] = host_ent(argv[optind + i], i);
+    host_list[i] = host_ent(ib_net_db, argv[optind + i], i);
     if (host_list[i] != NULL)
       nr_good_hosts++;
   }
 
   if (nr_good_hosts == 0)
-    FATAL("no good hosts\n");
+    FATAL("no good hosts, nr_hosts %zu\n", nr_hosts);
 
 #ifdef DEBUG
   umad_debug(9);
@@ -270,10 +280,24 @@ int main(int argc, char *argv[])
 
       nr_responses++;
 
-      if (nr_responses == nr_good)
+      if (nr_responses == nr_good_hosts) {
         TRACE("received all responses in %f seconds\n", dnow() - start[which]);
+        if (which == 1)
+          break;
+      }
     }
   }
+
+  for (i = 0; i < nr_hosts; i++) {
+    if (host_list[i] == NULL)
+      continue;
+    if (host_send_perf_umad(host_list[i]) < 0)
+      continue;
+    nr_sent++;
+  }
+
+  if (ib_net_db != NULL)
+    ib_net_db_close(ib_net_db);
 
   if (umad_fd >= 0)
     umad_close_port(umad_fd);

@@ -54,8 +54,10 @@ int ib_net_db_fetch(void *db, const char *ca, struct ib_net_ent *ent)
   };
 
   datum val = gdbm_fetch(db, key);
-  if (val.dptr == NULL)
-    goto out; /* Not found. */
+  if (val.dptr == NULL) {
+    TRACE("ca `%s' not found\n", ca);
+    goto out;
+  }
 
   if (val.dsize != sizeof(*ent))
     FATAL("bad DB entry for CA `%s' size %zu, expected %zu\n",
@@ -149,6 +151,7 @@ void ib_net_db_close(void *db)
   gdbm_close(db);
 }
 
+#ifdef IB_NET_DB_TEST
 int main(int argc, char *argv[])
 {
   const char *disc_path = NULL, *db_path = NULL;
@@ -188,3 +191,4 @@ int main(int argc, char *argv[])
 
   return 0;
 }
+#endif
