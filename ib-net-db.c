@@ -18,13 +18,28 @@ void *ib_net_db_open(const char *path, int flags, mode_t mode)
   if (path == NULL)
     path = IB_NET_DB_PATH;
 
-  dbf = gdbm_open((char*) path, 0, flags, mode, NULL /* fatal_func() */);
+  /* gdbm runs very slowly on Lustre if you allow it to use a 2M block size. */
+  dbf = gdbm_open((char*) path, 4096, flags, mode, NULL /* fatal_func() */);
+  if (dbf == NULL)
+    ERROR("cannot open ib net db `%s': %s\n", path, gdbm_strerror(gdbm_errno));
 
   return dbf;
 }
 
-int ib_net_db_store(void *db, const char *name, struct ib_net_ent *ent)
+int ib_net_db_store(void *db, const char *ca_name, struct ib_net_ent *ent)
 {
+  datum key = {
+    .dptr = (char *) ca_name,
+    .dsize = strlen(ca_name) + 1,
+  }, val = {
+    .dptr = (char *) ent,
+    .dsize = sizeof(*ent),
+  };
+
+  if (gdbm_store(db, key, val, GDBM_REPLACE) < 0) {
+    ERROR("cannot store `%s': %s\n", ca_name, gdbm_strerror(gdbm_errno));
+    return -1;
+  }
 
   return 0;
 }
@@ -89,10 +104,8 @@ int ib_net_db_fill(void *db, FILE *file, const char *path)
             ent.sw_port, ent.ca_guid, ent.ca_port, ca_desc, ent.ca_lid,
             chop(line, '\n'));
 
-      if (ib_net_db_store(db, chop(ca_desc, ' '), &ent) < 0) {
-        ERROR("cannot store net db entry for ca `%s': %m\n", ca_desc);
+      if (ib_net_db_store(db, chop(ca_desc, ' '), &ent) < 0)
         goto out;
-      }
     }
   }
 
@@ -109,9 +122,15 @@ int ib_net_db_fill(void *db, FILE *file, const char *path)
 
 int main(int argc, char *argv[])
 {
-  void *db = ib_net_db_open(NULL, GDBM_WRCREAT, 0666);
+  const char *disc_path = argv[1], *db_path = argv[2];
 
-  ib_net_db_fill(db, NULL, NULL);
+  void *db = ib_net_db_open(db_path, GDBM_NEWDB, 0666);
+
+  int fastmode = 1;
+  if (gdbm_setopt(db, GDBM_FASTMODE, &fastmode, sizeof(fastmode)) < 0)
+    ERROR("cannot set db to fast mode: %s\n", gdbm_strerror(gdbm_errno));
+
+  ib_net_db_fill(db, NULL, disc_path);
 
   gdbm_close(db);
 
