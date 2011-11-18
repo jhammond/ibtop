@@ -144,6 +144,11 @@ int ib_net_db_fill(void *db, FILE *file, const char *path)
   return rc;
 }
 
+void ib_net_db_close(void *db)
+{
+  gdbm_close(db);
+}
+
 int main(int argc, char *argv[])
 {
   const char *disc_path = NULL, *db_path = NULL;
