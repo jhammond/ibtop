@@ -82,6 +82,8 @@ static inline void dump_umad(void *um, size_t len)
     }
     fprintf(stderr, "\n");
   }
+  fprintf(stderr, "\n");
+
 #endif
 }
 
@@ -151,13 +153,13 @@ int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
     return -1;
   }
 
-  dump_umad(buf, nr);
-
   struct ib_user_mad *um = (struct ib_user_mad *) buf;
   void *m = umad_get_mad(um);
   uint64_t trid = mad_get_field64(m, 0, IB_MAD_TRID_F);
 
   TRACE("um trid "P_TRID", status %d\n", trid, um->status);
+
+  dump_umad(buf, nr);
 
   if (mad_get_field(m, 0, IB_DRSMP_STATUS_F) == IB_MAD_STS_REDIRECT) {
     /* FIXME */
@@ -207,21 +209,21 @@ int main(int argc, char *argv[])
 {
   struct host_ent **host_list = NULL;
   size_t nr_hosts = 0, i;
-  double delay = 10;
+  double interval = 10;
   void *ib_net_db = NULL;
 
   struct option opts[] = {
-    { "delay", 1, NULL, 'd' },
+    { "interval", 1, NULL, 'i' },
     { NULL, 0, NULL, 0},
   };
 
   int c;
-  while ((c = getopt_long(argc, argv, "d:", opts, 0)) != -1) {
+  while ((c = getopt_long(argc, argv, "i:", opts, 0)) != -1) {
     switch (c) {
-    case 'd':
-      delay = strtod(optarg, NULL);
-      if (delay <= 0)
-        FATAL("invalid delay `%s'\n", optarg);
+    case 'i':
+      interval = strtod(optarg, NULL);
+      if (interval <= 0)
+        FATAL("invalid interval `%s'\n", optarg);
       break;
     case '?':
       fprintf(stderr, "Try `%s --help' for more information.",
@@ -271,7 +273,7 @@ int main(int argc, char *argv[])
 
   double start[2];
   double deadline[2];
-  deadline[0] = dnow() + delay;
+  deadline[0] = dnow() + interval;
   deadline[1] = deadline[0] + 1;
 
   int which;
@@ -320,16 +322,15 @@ int main(int argc, char *argv[])
     }
   }
 
-  double t_rx_bs = 0, t_rx_ps = 0, t_tx_bs = 0, t_tx_ps = 0;
-
-
   printf("%-12s %12s %12s %12s %12s\n",
          "HOST", "RX_B/S", "RX_P/S", "TX_B/S", "TX_P/S");
 
+  double t_rx_bs = 0, t_rx_ps = 0, t_tx_bs = 0, t_tx_ps = 0;
+
   for (i = 0; i < nr_hosts; i++) {
     struct host_ent *h = host_list[i];
-    double rx_bs = h->h_rx_b / delay, rx_ps = h->h_rx_p / delay;
-    double tx_bs = h->h_tx_b / delay, tx_ps = h->h_tx_p / delay;
+    double rx_bs = h->h_rx_b / interval, rx_ps = h->h_rx_p / interval;
+    double tx_bs = h->h_tx_b / interval, tx_ps = h->h_tx_p / interval;
 
     t_rx_bs += rx_bs;
     t_rx_ps += rx_ps;
