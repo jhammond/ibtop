@@ -35,12 +35,13 @@ int umad_timeout_ms = 15;
 int umad_retries = 10;
 
 struct host_ent {
+  struct ib_net_ent h_ne;
+  uint64_t h_trid;
   uint64_t h_rx_b;
   uint64_t h_rx_p;
   uint64_t h_tx_b;
   uint64_t h_tx_p;
-  uint64_t h_trid;
-  struct ib_net_ent h_ne;
+  unsigned int h_valid:2;
   char h_name[];
 };
 
@@ -82,8 +83,6 @@ static inline void dump_umad(void *um, size_t len)
     }
     fprintf(stderr, "\n");
   }
-  fprintf(stderr, "\n");
-
 #endif
 }
 
@@ -140,16 +139,13 @@ int host_send_perf_umad(struct host_ent *h)
 int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
 {
   char buf[1024];
+  memset(buf, 0, sizeof(buf));
   size_t um_size = umad_size() + IB_MAD_SIZE;
-  /* memset(buf, 0, sizeof(buf)); */
 
   ssize_t nr = read(umad_fd, buf, sizeof(buf));
   if (nr < 0) {
     if (errno != EWOULDBLOCK)
       ERROR("error receiving mad: %m\n");
-    return -1;
-  } else if (nr < um_size) {
-    ERROR("short receive, expected %zu, only read %zd\n", um_size, nr);
     return -1;
   }
 
@@ -164,6 +160,11 @@ int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
   if (mad_get_field(m, 0, IB_DRSMP_STATUS_F) == IB_MAD_STS_REDIRECT) {
     /* FIXME */
     ERROR("received redirect, trid "P_TRID"\n", trid);
+    return -1;
+  }
+
+  if (nr < um_size) {
+    TRACE("short receive, expected %zu, only read %zd\n", um_size, nr);
     return -1;
   }
 
@@ -201,6 +202,7 @@ int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
   h->h_rx_p += which == 0 ? -rx_p : rx_p;
   h->h_tx_b += which == 0 ? -tx_b : tx_b;
   h->h_tx_p += which == 0 ? -tx_p : tx_p;
+  h->h_valid |= 1u << which;
 
   return 0;
 }
@@ -317,7 +319,10 @@ int main(int argc, char *argv[])
     TRACE("sent %zu in %f seconds\n", nr_sent, dnow() - start[which]);
 
     while (1) {
-      int poll_timeout_ms = 1000 * (deadline[which] - dnow());
+      double poll_timeout_ms = (deadline[which] - dnow()) * 1000;
+      if (poll_timeout_ms <= 0)
+        break;
+
       struct pollfd poll_fds = {
         .fd = umad_fd,
         .events = POLLIN,
@@ -325,7 +330,7 @@ int main(int argc, char *argv[])
 
       int np = poll(&poll_fds, 1, poll_timeout_ms);
       if (np < 0)
-        FATAL("error polling for mads: %m\n");
+        FATAL("error polling for responses: %m\n");
 
       if (np == 0) {
         TRACE("timedout waiting for mad, nr_responses %zu\n", nr_responses);
@@ -352,6 +357,10 @@ int main(int argc, char *argv[])
 
   for (i = 0; i < nr_hosts; i++) {
     struct host_ent *h = host_list[i];
+    if (h->h_valid != 3)
+      TRACE("skipping host `%s', valid %u\n",
+            h->h_name, (unsigned int) h->h_valid);
+
     double rx_kbs = h->h_rx_b / interval / 1024;
     double rx_ps = h->h_rx_p / interval;
     double tx_kbs = h->h_tx_b / interval / 1024;
