@@ -120,7 +120,7 @@ int host_send_perf_umad(struct host_ent *h)
   mad_set_field(pc, 0, IB_PC_PORT_SELECT_F, h->h_ne.ne_port);
 
   TRACE("sending perf umad for host `%s', "
-        "lid %"PRIu16", port %"PRIu8", is_hca %u, trid "P_TRID"\n",
+        "lid %"PRIx16", port %"PRIx8", is_hca %u, trid "P_TRID"\n",
         h->h_name, h->h_ne.ne_lid, h->h_ne.ne_port,
         (unsigned int) h->h_ne.ne_is_hca, h->h_trid);
 
@@ -157,7 +157,7 @@ int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
   void *m = umad_get_mad(um);
   uint64_t trid = mad_get_field64(m, 0, IB_MAD_TRID_F);
 
-  TRACE("um trid "P_TRID", status %d\n", trid, um->status);
+  TRACE("received umad trid "P_TRID", status %d\n", trid, um->status);
 
   dump_umad(buf, nr);
 
@@ -245,10 +245,13 @@ int main(int argc, char *argv[])
   host_list = calloc(nr_host_args, sizeof(host_list[0]));
 
   for (i = 0; i < nr_host_args; i++) {
-    struct host_ent *h = host_ent(ib_net_db, argv[optind + i], nr_hosts);
+    char *name = argv[optind + i];
+    struct host_ent *h = host_ent(ib_net_db, name, nr_hosts);
 
-    if (h == NULL)
+    if (h == NULL) {
+      ERROR("unknown host `%s'\n", name);
       continue;
+    }
 
     host_list[nr_hosts++] = h;
   }
@@ -323,26 +326,28 @@ int main(int argc, char *argv[])
   }
 
   printf("%-12s %12s %12s %12s %12s\n",
-         "HOST", "RX_B/S", "RX_P/S", "TX_B/S", "TX_P/S");
+         "HOST", "RX_KB/S", "RX_P/S", "TX_KB/S", "TX_P/S");
 
-  double t_rx_bs = 0, t_rx_ps = 0, t_tx_bs = 0, t_tx_ps = 0;
+  double t_rx_kbs = 0, t_rx_ps = 0, t_tx_kbs = 0, t_tx_ps = 0;
 
   for (i = 0; i < nr_hosts; i++) {
     struct host_ent *h = host_list[i];
-    double rx_bs = h->h_rx_b / interval, rx_ps = h->h_rx_p / interval;
-    double tx_bs = h->h_tx_b / interval, tx_ps = h->h_tx_p / interval;
+    double rx_kbs = h->h_rx_b / interval / 1024;
+    double rx_ps = h->h_rx_p / interval;
+    double tx_kbs = h->h_tx_b / interval / 1024;
+    double tx_ps = h->h_tx_p / interval;
 
-    t_rx_bs += rx_bs;
+    t_rx_kbs += rx_kbs;
     t_rx_ps += rx_ps;
-    t_tx_bs += tx_bs;
+    t_tx_kbs += tx_kbs;
     t_tx_ps += tx_ps;
 
     printf("%-12s %12.3f %12.3f %12.3f %12.3f\n",
-           h->h_name, rx_bs, rx_ps, tx_bs, tx_ps);
+           h->h_name, rx_kbs, rx_ps, tx_kbs, tx_ps);
   }
 
   printf("%-12s %12.3f %12.3f %12.3f %12.3f\n",
-         "TOTAL", t_rx_bs, t_rx_ps, t_tx_bs, t_tx_ps);
+         "TOTAL", t_rx_kbs, t_rx_ps, t_tx_kbs, t_tx_ps);
 
   if (ib_net_db != NULL)
     ib_net_db_close(ib_net_db);
