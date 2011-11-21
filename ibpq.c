@@ -44,7 +44,7 @@ struct host_ent {
   char h_name[];
 };
 
-struct host_ent *host_ent(void *db, const char *name, size_t i)
+struct host_ent *host_ent(struct ib_net_db *nd, const char *name, size_t i)
 {
   struct host_ent *h;
 
@@ -54,7 +54,7 @@ struct host_ent *host_ent(void *db, const char *name, size_t i)
 
   h->h_trid = TRID_BASE + i;
 
-  if (ib_net_db_fetch(db, h->h_name, &h->h_ne) <= 0)
+  if (ib_net_db_fetch(nd, h->h_name, &h->h_ne) <= 0)
     goto err;
 
   return h;
@@ -210,7 +210,7 @@ int main(int argc, char *argv[])
   struct host_ent **host_list = NULL;
   size_t nr_hosts = 0, i;
   double interval = 10;
-  void *ib_net_db = NULL;
+  struct ib_net_db nd;
 
   struct option opts[] = {
     { "interval", 1, NULL, 'i' },
@@ -232,32 +232,52 @@ int main(int argc, char *argv[])
     }
   }
 
-  if (argc - optind <= 0)
-    FATAL("missing host list\n"
-          "Try `%s --help' for more information.",
-          program_invocation_short_name);
-
-  ib_net_db = ib_net_db_open(NULL, 0, 0);
-  if (ib_net_db == NULL)
+  if (ib_net_db_open(&nd, NULL, 0, 0) < 0)
     FATAL("cannot open IB net DB\n");
 
-  size_t nr_host_args = argc - optind;
-  host_list = calloc(nr_host_args, sizeof(host_list[0]));
+  if (argc > optind) {
+    size_t nr_host_args = argc - optind;
+    host_list = calloc(nr_host_args, sizeof(host_list[0]));
 
-  for (i = 0; i < nr_host_args; i++) {
-    char *name = argv[optind + i];
-    struct host_ent *h = host_ent(ib_net_db, name, nr_hosts);
+    for (i = 0; i < nr_host_args; i++) {
+      char *name = argv[optind + i];
+      struct host_ent *h = host_ent(&nd, name, nr_hosts);
 
-    if (h == NULL) {
-      ERROR("unknown host `%s'\n", name);
-      continue;
+      if (h == NULL) {
+        ERROR("unknown host `%s'\n", name);
+        continue;
+      }
+
+      host_list[nr_hosts++] = h;
     }
 
-    host_list[nr_hosts++] = h;
+    if (nr_hosts == 0)
+      FATAL("no good hosts out of %zu\n", nr_host_args);
+  } else {
+    char *name = NULL;
+    size_t name_size = 0;
+
+    host_list = calloc(nd.nd_count, sizeof(host_list[0]));
+
+    while (nr_hosts < nd.nd_count) {
+      ib_net_db_iter(&nd, &name, &name_size);
+      if (name == NULL)
+        break;
+
+      struct host_ent *h = host_ent(&nd, name, nr_hosts);
+
+      if (h == NULL) {
+        ERROR("unknown host `%s'\n", name);
+        continue;
+      }
+
+      host_list[nr_hosts++] = h;
+    }
+
+    free(name);
   }
 
-  if (nr_hosts == 0)
-    FATAL("no good hosts out of %zu\n", nr_host_args);
+  ib_net_db_close(&nd);
 
 #ifdef DEBUG
   umad_debug(9);
@@ -348,9 +368,6 @@ int main(int argc, char *argv[])
 
   printf("%-12s %12.3f %12.3f %12.3f %12.3f\n",
          "TOTAL", t_rx_kbs, t_rx_ps, t_tx_kbs, t_tx_ps);
-
-  if (ib_net_db != NULL)
-    ib_net_db_close(ib_net_db);
 
   if (umad_fd >= 0)
     umad_close_port(umad_fd);
