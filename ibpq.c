@@ -10,9 +10,9 @@
 #include <infiniband/umad.h>
 #include <infiniband/mad.h>
 #include <stdint.h>
+#include "ib-net-db.h"
 #include "string1.h"
 #include "trace.h"
-#include "ibtop.h"
 
 #define TRID_BASE 0xE1F2A3B4C5D6E7F8
 
@@ -40,7 +40,7 @@ struct host_ent {
   uint64_t h_tx_b;
   uint64_t h_tx_p;
   uint64_t h_trid;
-  struct ib_net_ent h_net;
+  struct ib_net_ent h_ne;
   char h_name[];
 };
 
@@ -54,7 +54,7 @@ struct host_ent *host_ent(void *db, const char *name, size_t i)
 
   h->h_trid = TRID_BASE + i;
 
-  if (ib_net_db_fetch(db, h->h_name, &h->h_net) <= 0)
+  if (ib_net_db_fetch(db, h->h_name, &h->h_ne) <= 0)
     goto err;
 
   return h;
@@ -62,51 +62,6 @@ struct host_ent *host_ent(void *db, const char *name, size_t i)
  err:
   free(h);
   return NULL;
-}
-
-int host_send_perf_umad(struct host_ent *h)
-{
-  char buf[1024];
-  struct ib_user_mad *um;
-  void *m;
-
-  memset(buf, 0, sizeof(buf));
-
-  um = (struct ib_user_mad *) buf;
-  umad_set_addr(um, h->h_net.sw_lid, 1, 0, IB_DEFAULT_QP1_QKEY);
-
-  um->agent_id   = umad_agent_id;
-  um->timeout_ms = umad_timeout_ms;
-  um->retries    = umad_retries;
-
-  m = umad_get_mad(um);
-  mad_set_field(m, 0, IB_MAD_METHOD_F, IB_MAD_METHOD_GET);
-  /* mad_set_field(m, 0, IB_MAD_RESPONSE_F, 0); */
-  /* mad_set_field(m, 0, IB_MAD_STATUS_F, 0 ); *//* rpc->rstatus */
-  mad_set_field(m, 0, IB_MAD_CLASSVER_F, 1);
-  mad_set_field(m, 0, IB_MAD_MGMTCLASS_F, IB_PERFORMANCE_CLASS);
-  mad_set_field(m, 0, IB_MAD_BASEVER_F, 1);
-  mad_set_field(m, 0, IB_MAD_ATTRID_F, IB_GSI_PORT_COUNTERS_EXT);
-  /* mad_set_field(m, 0, IB_MAD_ATTRMOD_F, 0); *//* rpc->attr.mod */
-  /* mad_set_field64(m, 0, IB_MAD_MKEY_F, 0); *//* rpc->mkey */
-
-  mad_set_field64(m, 0, IB_MAD_TRID_F, h->h_trid);
-
-  void *pc = (char *) m + IB_PC_DATA_OFFS;
-  mad_set_field(pc, 0, IB_PC_PORT_SELECT_F, h->h_net.sw_port);
-
-  TRACE("sending host `%s', sw_lid %"PRIu16", sw_port %"PRIu8", trid "P_TRID"\n",
-        h->h_name, h->h_net.sw_lid, h->h_net.sw_port, h->h_trid);
-
-  ssize_t nw = write(umad_fd, um, umad_size() + IB_MAD_SIZE);
-  if (nw < 0) {
-    ERROR("cannot send umad for host `%s': %m\n", h->h_name);
-    return -1;
-  } else if (nw < umad_size() + IB_MAD_SIZE) {
-    /* ... */
-  }
-
-  return 0;
 }
 
 static inline void dump_umad(void *um, size_t len)
@@ -130,9 +85,60 @@ static inline void dump_umad(void *um, size_t len)
 #endif
 }
 
+int host_send_perf_umad(struct host_ent *h)
+{
+  char buf[1024];
+  struct ib_user_mad *um;
+  size_t um_size = umad_size() + IB_MAD_SIZE;
+  void *m;
+
+  memset(buf, 0, sizeof(buf));
+
+  um = (struct ib_user_mad *) buf;
+  umad_set_addr(um, h->h_ne.ne_lid, 1, 0, IB_DEFAULT_QP1_QKEY);
+
+  um->agent_id   = umad_agent_id;
+  um->timeout_ms = umad_timeout_ms;
+  um->retries    = umad_retries;
+
+  m = umad_get_mad(um);
+  mad_set_field(m, 0, IB_MAD_METHOD_F, IB_MAD_METHOD_GET);
+  /* mad_set_field(m, 0, IB_MAD_RESPONSE_F, 0); */
+  /* mad_set_field(m, 0, IB_MAD_STATUS_F, 0 ); *//* rpc->rstatus */
+  mad_set_field(m, 0, IB_MAD_CLASSVER_F, 1);
+  mad_set_field(m, 0, IB_MAD_MGMTCLASS_F, IB_PERFORMANCE_CLASS);
+  mad_set_field(m, 0, IB_MAD_BASEVER_F, 1);
+  mad_set_field(m, 0, IB_MAD_ATTRID_F, IB_GSI_PORT_COUNTERS_EXT);
+  /* mad_set_field(m, 0, IB_MAD_ATTRMOD_F, 0); *//* rpc->attr.mod */
+  /* mad_set_field64(m, 0, IB_MAD_MKEY_F, 0); *//* rpc->mkey */
+
+  mad_set_field64(m, 0, IB_MAD_TRID_F, h->h_trid);
+
+  void *pc = (char *) m + IB_PC_DATA_OFFS;
+  mad_set_field(pc, 0, IB_PC_PORT_SELECT_F, h->h_ne.ne_port);
+
+  TRACE("sending perf umad for host `%s', "
+        "lid %"PRIu16", port %"PRIu8", is_hca %u, trid "P_TRID"\n",
+        h->h_name, h->h_ne.ne_lid, h->h_ne.ne_port,
+        (unsigned int) h->h_ne.ne_is_hca, h->h_trid);
+
+  dump_umad(um, um_size);
+
+  ssize_t nw = write(umad_fd, um, um_size);
+  if (nw < 0) {
+    ERROR("error sending umad for host `%s': %m\n", h->h_name);
+    return -1;
+  } else if (nw < um_size) {
+    /* ... */
+  }
+
+  return 0;
+}
+
 int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
 {
   char buf[1024];
+  size_t um_size = umad_size() + IB_MAD_SIZE;
   /* memset(buf, 0, sizeof(buf)); */
 
   ssize_t nr = read(umad_fd, buf, sizeof(buf));
@@ -140,9 +146,8 @@ int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
     if (errno != EWOULDBLOCK)
       ERROR("error receiving mad: %m\n");
     return -1;
-  } else if (nr < umad_size() + IB_MAD_SIZE) {
-    ERROR("short receive, expected %zu, only read %zd\n",
-          (size_t) (umad_size() + IB_MAD_SIZE), nr);
+  } else if (nr < um_size) {
+    ERROR("short receive, expected %zu, only read %zd\n", um_size, nr);
     return -1;
   }
 
@@ -152,8 +157,7 @@ int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
   void *m = umad_get_mad(um);
   uint64_t trid = mad_get_field64(m, 0, IB_MAD_TRID_F);
 
-  TRACE("um status %d\n", um->status);
-  TRACE("um trid "P_TRID"\n", trid);
+  TRACE("um trid "P_TRID", status %d\n", trid, um->status);
 
   if (mad_get_field(m, 0, IB_DRSMP_STATUS_F) == IB_MAD_STS_REDIRECT) {
     /* FIXME */
@@ -175,24 +179,26 @@ int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
     return -1;
   }
 
-  TRACE("host `%s', sw_lid %"PRIx16", sw_port %"PRIx8"\n",
-        h->h_name, h->h_net.sw_lid, h->h_net.sw_port);
+  unsigned int is_hca = h->h_ne.ne_is_hca;
+
+  TRACE("host `%s', lid %"PRIx16", port %"PRIx8", is_hca %u\n",
+        h->h_name, h->h_ne.ne_lid, h->h_ne.ne_port, is_hca);
 
   void *pc = (char *) m + IB_PC_DATA_OFFS;
-  uint64_t sw_rx_b, sw_rx_p, sw_tx_b, sw_tx_p;
+  uint64_t rx_b, rx_p, tx_b, tx_p;
 
-  mad_decode_field(pc, IB_PC_EXT_RCV_BYTES_F, &sw_rx_b);
-  mad_decode_field(pc, IB_PC_EXT_RCV_PKTS_F,  &sw_rx_p);
-  mad_decode_field(pc, IB_PC_EXT_XMT_BYTES_F, &sw_tx_b);
-  mad_decode_field(pc, IB_PC_EXT_XMT_PKTS_F,  &sw_tx_p);
+  mad_decode_field(pc, IB_PC_EXT_RCV_BYTES_F, is_hca ? &rx_b : &tx_b);
+  mad_decode_field(pc, IB_PC_EXT_RCV_PKTS_F,  is_hca ? &rx_p : &tx_p);
+  mad_decode_field(pc, IB_PC_EXT_XMT_BYTES_F, is_hca ? &tx_b : &rx_b);
+  mad_decode_field(pc, IB_PC_EXT_XMT_PKTS_F,  is_hca ? &tx_p : &rx_p);
 
   TRACE("rx_b %"PRIx64", rx_p %"PRIx64", tx_b %"PRIx64", tx_p %"PRIx64"\n",
-        sw_rx_b, sw_rx_p, sw_tx_b, sw_tx_p);
+        rx_b, rx_p, tx_b, tx_p);
 
-  h->h_rx_b += which == 0 ? -sw_tx_b : sw_tx_b;
-  h->h_rx_p += which == 0 ? -sw_tx_p : sw_tx_p;
-  h->h_tx_b += which == 0 ? -sw_rx_b : sw_rx_b;
-  h->h_tx_p += which == 0 ? -sw_rx_p : sw_rx_p;
+  h->h_rx_b += which == 0 ? -rx_b : rx_b;
+  h->h_rx_p += which == 0 ? -rx_p : rx_p;
+  h->h_tx_b += which == 0 ? -tx_b : tx_b;
+  h->h_tx_p += which == 0 ? -tx_p : tx_p;
 
   return 0;
 }
@@ -200,7 +206,7 @@ int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
 int main(int argc, char *argv[])
 {
   struct host_ent **host_list = NULL;
-  size_t nr_hosts = 0, nr_good_hosts = 0, i;
+  size_t nr_hosts = 0, i;
   double delay = 10;
   void *ib_net_db = NULL;
 
@@ -233,17 +239,20 @@ int main(int argc, char *argv[])
   if (ib_net_db == NULL)
     FATAL("cannot open IB net DB\n");
 
-  nr_hosts = argc - optind;
-  host_list = calloc(nr_hosts, sizeof(host_list[0]));
+  size_t nr_host_args = argc - optind;
+  host_list = calloc(nr_host_args, sizeof(host_list[0]));
 
-  for (i = 0; i < nr_hosts; i++) {
-    host_list[i] = host_ent(ib_net_db, argv[optind + i], i);
-    if (host_list[i] != NULL)
-      nr_good_hosts++;
+  for (i = 0; i < nr_host_args; i++) {
+    struct host_ent *h = host_ent(ib_net_db, argv[optind + i], nr_hosts);
+
+    if (h == NULL)
+      continue;
+
+    host_list[nr_hosts++] = h;
   }
 
-  if (nr_good_hosts == 0)
-    FATAL("no good hosts, nr_hosts %zu\n", nr_hosts);
+  if (nr_hosts == 0)
+    FATAL("no good hosts out of %zu\n", nr_host_args);
 
 #ifdef DEBUG
   umad_debug(9);
@@ -268,7 +277,7 @@ int main(int argc, char *argv[])
   int which;
   for (which = 0; which < 2; which++) {
 
-    int nr_sent = 0, nr_responses = 0;
+    size_t nr_sent = 0, nr_responses = 0;
 
     start[which] = dnow();
 
@@ -280,7 +289,7 @@ int main(int argc, char *argv[])
       nr_sent++;
     }
 
-    TRACE("sent %zu in %f seconds\n", nr_good_hosts, dnow() - start[which]);
+    TRACE("sent %zu in %f seconds\n", nr_sent, dnow() - start[which]);
 
     while (1) {
       int poll_timeout_ms = 1000 * (deadline[which] - dnow());
@@ -294,7 +303,7 @@ int main(int argc, char *argv[])
         FATAL("error polling for mads: %m\n");
 
       if (np == 0) {
-        TRACE("timedout waiting for mad, nr_responses %d\n", nr_responses);
+        TRACE("timedout waiting for mad, nr_responses %zu\n", nr_responses);
         break;
       }
 
@@ -303,7 +312,7 @@ int main(int argc, char *argv[])
 
       nr_responses++;
 
-      if (nr_responses == nr_good_hosts) {
+      if (nr_responses == nr_sent) {
         TRACE("received all responses in %f seconds\n", dnow() - start[which]);
         if (which == 1)
           break;
@@ -311,11 +320,28 @@ int main(int argc, char *argv[])
     }
   }
 
+  double t_rx_bs = 0, t_rx_ps = 0, t_tx_bs = 0, t_tx_ps = 0;
+
+
+  printf("%-12s %12s %12s %12s %12s\n",
+         "HOST", "RX_B/S", "RX_P/S", "TX_B/S", "TX_P/S");
+
   for (i = 0; i < nr_hosts; i++) {
-    if (host_list[i] == NULL)
-      continue;
-    /* Aggregate. */
+    struct host_ent *h = host_list[i];
+    double rx_bs = h->h_rx_b / delay, rx_ps = h->h_rx_p / delay;
+    double tx_bs = h->h_tx_b / delay, tx_ps = h->h_tx_p / delay;
+
+    t_rx_bs += rx_bs;
+    t_rx_ps += rx_ps;
+    t_tx_bs += tx_bs;
+    t_tx_ps += tx_ps;
+
+    printf("%-12s %12.3f %12.3f %12.3f %12.3f\n",
+           h->h_name, rx_bs, rx_ps, tx_bs, tx_ps);
   }
+
+  printf("%-12s %12.3f %12.3f %12.3f %12.3f\n",
+         "TOTAL", t_rx_bs, t_rx_ps, t_tx_bs, t_tx_ps);
 
   if (ib_net_db != NULL)
     ib_net_db_close(ib_net_db);
