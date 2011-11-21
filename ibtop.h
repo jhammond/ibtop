@@ -3,6 +3,9 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+#define P_GUID "%016"PRIx64
+#define P_TRID "%016"PRIx64
+
 struct ib_net_ent {
   uint64_t ca_guid;
   uint64_t sw_guid;

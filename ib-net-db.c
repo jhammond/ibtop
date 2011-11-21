@@ -77,6 +77,7 @@ int ib_net_db_fetch(void *db, const char *ca, struct ib_net_ent *ent)
    sysimgguid=0x144fa5eb880051
    switchguid=0x144fa5eb880050(144fa5eb880050)
    Switch  24 "S-00144fa5eb880050"        # "MT47396 Infiniscale-III Mellanox Technologies" base port 0 lid 3229 lmc 0
+   [1] "H-00144fa5eb88002c"[1](144fa5eb88002d) # "i115-312 HCA-1" lid 5290 4xSDR
    ... */
 
 int ib_net_db_fill(void *db, FILE *file, const char *path)
@@ -110,7 +111,7 @@ int ib_net_db_fill(void *db, FILE *file, const char *path)
                &ent.sw_guid, &ent.sw_lid) != 2)
       continue;
 
-    TRACE("sw_guid %016"PRIx64", sw_lid %"PRIu16", line `%s'\n",
+    TRACE("sw_guid "P_GUID", sw_lid %"PRIu16", line `%s'\n",
           ent.sw_guid, ent.sw_lid, chop(line, '\n'));
 
     /* OK, we have a switch record. */
@@ -126,7 +127,7 @@ int ib_net_db_fill(void *db, FILE *file, const char *path)
                  &ent.sw_port, &ent.ca_guid, &ent.ca_port, ca_desc, &ent.ca_lid) != 5)
         continue;
 
-      TRACE("sw_port %2"PRIu8", ca_guid %016"PRIx64", ca_port %2"PRIu8", "
+      TRACE("sw_port %2"PRIu8", ca_guid "P_GUID", ca_port %2"PRIu8", "
             "ca_desc `%s', ca_lid %"PRIu16", line `%s'\n",
             ent.sw_port, ent.ca_guid, ent.ca_port, ca_desc, ent.ca_lid,
             chop(line, '\n'));
@@ -179,8 +180,8 @@ int main(int argc, char *argv[])
 
   if (ib_net_db_fetch(db, ca, &ent) > 0)
     printf("%s "
-           "sw_guid %016"PRIx64", sw_lid %"PRIu16", sw_port %2"PRIu8", "
-           "ca_guid %016"PRIx64", ca_lid %"PRIu16", ca_port %2"PRIu8"\n",
+           "sw_guid "P_GUID", sw_lid %"PRIu16", sw_port %2"PRIu8", "
+           "ca_guid "P_GUID", ca_lid %"PRIu16", ca_port %2"PRIu8"\n",
            ca,
            ent.sw_guid, ent.sw_lid, ent.sw_port,
            ent.ca_guid, ent.ca_lid, ent.ca_port);

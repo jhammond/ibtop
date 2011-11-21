@@ -14,7 +14,7 @@
 #include "trace.h"
 #include "ibtop.h"
 
-#define HOST_TRID_BASE 0xE1F2A3B4C5D6E7F8
+#define TRID_BASE 0xE1F2A3B4C5D6E7F8
 
 static inline double dnow(void)
 {
@@ -52,7 +52,7 @@ struct host_ent *host_ent(void *db, const char *name, size_t i)
   memset(h, 0, sizeof(*h));
   strcpy(h->h_name, name);
 
-  h->h_trid = HOST_TRID_BASE + i;
+  h->h_trid = TRID_BASE + i;
 
   if (ib_net_db_fetch(db, h->h_name, &h->h_net) <= 0)
     goto err;
@@ -95,7 +95,7 @@ int host_send_perf_umad(struct host_ent *h)
   void *pc = (char *) m + IB_PC_DATA_OFFS;
   mad_set_field(pc, 0, IB_PC_PORT_SELECT_F, h->h_net.sw_port);
 
-  TRACE("sending host `%s', sw_lid %"PRIu16", sw_port %"PRIu8", trid %"PRIx64"\n",
+  TRACE("sending host `%s', sw_lid %"PRIu16", sw_port %"PRIu8", trid "P_TRID"\n",
         h->h_name, h->h_net.sw_lid, h->h_net.sw_port, h->h_trid);
 
   ssize_t nw = write(umad_fd, um, umad_size() + IB_MAD_SIZE);
@@ -153,25 +153,25 @@ int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
   uint64_t trid = mad_get_field64(m, 0, IB_MAD_TRID_F);
 
   TRACE("um status %d\n", um->status);
-  TRACE("um trid %016"PRIx64"\n", trid);
+  TRACE("um trid "P_TRID"\n", trid);
 
   if (mad_get_field(m, 0, IB_DRSMP_STATUS_F) == IB_MAD_STS_REDIRECT) {
     /* FIXME */
-    ERROR("received redirect, trid %016"PRIx64"\n", trid);
+    ERROR("received redirect, trid "P_TRID"\n", trid);
     return -1;
   }
 
-  size_t i = (uint32_t) (trid - HOST_TRID_BASE);
+  size_t i = (uint32_t) (trid - TRID_BASE);
   TRACE("i %zu\n", i);
 
   if (!(0 <= i && i < nr_hosts)) {
-    ERROR("bad trid in received umad %"PRIx64"\n", trid);
+    ERROR("bad trid "P_TRID" in received umad\n", trid);
     return -1;
   }
 
   struct host_ent *h = host_list[i];
   if (h == NULL) {
-    ERROR("no host for received umad %"PRIx64"\n", trid);
+    ERROR("no host for umad, trid "P_TRID"\n", trid);
     return -1;
   }
 
