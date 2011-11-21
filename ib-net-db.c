@@ -5,7 +5,7 @@
 #include <sys/types.h>
 #include "trace.h"
 #include "string1.h"
-#include "ibtop.h"
+#include "ib-net-db.h"
 #include "gdbm.h"
 
 #define IB_NET_DISC_OUT "IB_NET_DISC.OUT"
@@ -26,44 +26,45 @@ void *ib_net_db_open(const char *path, int flags, mode_t mode)
   return db;
 }
 
-int ib_net_db_store(void *db, const char *ca, const struct ib_net_ent *ent)
+int ib_net_db_store(void *db, const char *host, const struct ib_net_ent *ne)
 {
   datum key = {
-    .dptr = (char *) ca,
-    .dsize = strlen(ca) + 1,
+    .dptr = (char *) host,
+    .dsize = strlen(host) + 1,
   }, val = {
-    .dptr = (char *) ent,
-    .dsize = sizeof(*ent),
+    .dptr = (char *) ne,
+    .dsize = sizeof(*ne),
   };
 
   if (gdbm_store(db, key, val, GDBM_REPLACE) < 0) {
-    ERROR("cannot store IB net DB entry for CA `%s': %s\n", ca, gdbm_strerror(gdbm_errno));
+    ERROR("cannot store IB net DB entry for host `%s': %s\n",
+          host, gdbm_strerror(gdbm_errno));
     return -1;
   }
 
   return 0;
 }
 
-int ib_net_db_fetch(void *db, const char *ca, struct ib_net_ent *ent)
+int ib_net_db_fetch(void *db, const char *host, struct ib_net_ent *ne)
 {
   int rc = 0;
 
   datum key = {
-    .dptr = (char *) ca,
-    .dsize = strlen(ca) + 1,
+    .dptr = (char *) host,
+    .dsize = strlen(host) + 1,
   };
 
   datum val = gdbm_fetch(db, key);
   if (val.dptr == NULL) {
-    TRACE("ca `%s' not found\n", ca);
+    TRACE("no IB net DB entry for host `%s'\n", host);
     goto out;
   }
 
-  if (val.dsize != sizeof(*ent))
-    FATAL("bad DB entry for CA `%s' size %zu, expected %zu\n",
-          ca, (size_t) val.dsize, sizeof(*ent));
+  if (val.dsize != sizeof(*ne))
+    FATAL("bad IB net DB entry for host `%s' size %zu, expected %zu\n",
+          host, (size_t) val.dsize, sizeof(*ne));
 
-  memcpy(ent, val.dptr, sizeof(*ent));
+  memcpy(ne, val.dptr, sizeof(*ne));
   rc = 1;
  out:
   free(val.dptr);
@@ -104,35 +105,50 @@ int ib_net_db_fill(void *db, FILE *file, const char *path)
   }
 
   while (getline(&line, &line_size, file) >= 0) {
-    struct ib_net_ent ent;
+    uint64_t sw_guid;
+    uint16_t sw_lid;
 
     /* Scan for switch records. */
     if (sscanf(line, "Switch %*d \"S-%"SCNx64"\" # \"%*[^\"]\" %*s port %*d lid %"SCNu16,
-               &ent.sw_guid, &ent.sw_lid) != 2)
+               &sw_guid, &sw_lid) != 2)
       continue;
 
     TRACE("sw_guid "P_GUID", sw_lid %"PRIu16", line `%s'\n",
-          ent.sw_guid, ent.sw_lid, chop(line, '\n'));
+          sw_guid, sw_lid, chop(line, '\n'));
 
     /* OK, we have a switch record. */
 
     while (getline(&line, &line_size, file) >= 0) {
-      char ca_desc[64];
+      uint64_t hca_guid;
+      uint16_t hca_lid;
+      uint8_t sw_port, hca_port;
+      char hca_desc[64], *host;
+      unsigned int use_hca = 0; /* TODO */
 
       if (isspace(*line))
         break;
 
+      /* [1] "H-00144fa5eb88002c"[1](144fa5eb88002d) # "i115-312 HCA-1" lid 5290 4xSDR */
       if (sscanf(line,
                  "[%"SCNu8"] \"H-%"SCNx64"\"[%"SCNu8"](%*x) # \"%64[^\"]\" lid %"SCNu16,
-                 &ent.sw_port, &ent.ca_guid, &ent.ca_port, ca_desc, &ent.ca_lid) != 5)
+                 &sw_port, &hca_guid, &hca_port, hca_desc, &hca_lid) != 5)
         continue;
 
-      TRACE("sw_port %2"PRIu8", ca_guid "P_GUID", ca_port %2"PRIu8", "
-            "ca_desc `%s', ca_lid %"PRIu16", line `%s'\n",
-            ent.sw_port, ent.ca_guid, ent.ca_port, ca_desc, ent.ca_lid,
+      host = chop(hca_desc, ' ');
+
+      TRACE("sw_port %2"PRIu8", hca_guid "P_GUID", hca_port %2"PRIu8", "
+            "host `%s', hca_lid %"PRIu16", line `%s'\n",
+            sw_port, hca_guid, hca_port, host, hca_lid,
             chop(line, '\n'));
 
-      if (ib_net_db_store(db, chop(ca_desc, ' '), &ent) < 0)
+      struct ib_net_ent ne = {
+        .ne_guid = use_hca ? hca_guid : sw_guid,
+        .ne_lid = use_hca ? hca_lid : sw_lid,
+        .ne_port = use_hca ? hca_port : sw_port,
+        .ne_is_hca = use_hca,
+      };
+
+      if (ib_net_db_store(db, host, &ne) < 0)
         goto out;
     }
   }
@@ -174,19 +190,15 @@ int main(int argc, char *argv[])
 
   gdbm_sync(db);
 
+  const char *host = "i115-301";
+  struct ib_net_ent ne;
 
-  const char *ca = "i115-301";
-  struct ib_net_ent ent;
-
-  if (ib_net_db_fetch(db, ca, &ent) > 0)
+  if (ib_net_db_fetch(db, host, &ne) > 0)
     printf("%s "
-           "sw_guid "P_GUID", sw_lid %"PRIu16", sw_port %2"PRIu8", "
-           "ca_guid "P_GUID", ca_lid %"PRIu16", ca_port %2"PRIu8"\n",
-           ca,
-           ent.sw_guid, ent.sw_lid, ent.sw_port,
-           ent.ca_guid, ent.ca_lid, ent.ca_port);
+           "guid "P_GUID", lid %"PRIu16", port %2"PRIu8", is_hca %u\n",
+           host, ne.ne_guid, ne.ne_lid, ne.ne_port, (unsigned) ne.ne_is_hca);
   else
-    printf("%s NOT_FOUND\n", ca);
+    printf("%s NOT_FOUND\n", host);
 
   gdbm_close(db);
 
