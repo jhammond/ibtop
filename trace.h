@@ -22,4 +22,6 @@ static inline void TRACE(char *fmt, ...) { }
     exit(1);\
   } while (0)
 
+#define OOM() FATAL("cannot allocate memory\n")
+
 #endif
