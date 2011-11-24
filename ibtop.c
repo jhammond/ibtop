@@ -8,6 +8,7 @@
 #include <time.h>
 #include <getopt.h>
 #include <malloc.h>
+#include <sys/stat.h>
 #include <infiniband/umad.h>
 #include <infiniband/mad.h>
 #include "ib-net-db.h"
@@ -15,12 +16,20 @@
 #include "trace.h"
 #include "dict.h"
 
-#define IBTOP_JOB_MAP_CMD "/opt/ibtop/make_job_map"
-#define IBTOP_JOB_MAP_PATH "/var/run/ibtop_job_map"
+#define IBTOP_NET_DB_PATH "/var/run/ibtop-net-db"
+#define IBTOP_NET_DISC_CMD "/opt/ofed/sbin/ibnetdiscover"
+#define IBTOP_JOB_MAP_PATH "/var/run/ibtop-job-map"
+#define IBTOP_JOB_MAP_CMD "/opt/ibtop/make-job-map"
+#define IBTOP_JOB_MAP_MAX_AGE 180
 
-#define NR_JOBS_HINT 200
+#define NR_JOBS_HINT 256
 #define NR_HOSTS_HINT 4096
 #define TRID_BASE 0xE1F2A3B4C5D6E7F8
+
+/* /sys/class/infiniband/HCA_NAME/ports/HCA_PORT */
+
+char *hca_name = "mlx4_0";
+int hca_port = 1;
 
 #define GET_NAMED(ptr,member,name) \
   (ptr) = (typeof(ptr)) (((char *) name) - offsetof(typeof(*ptr), member))
@@ -42,20 +51,12 @@ static inline double dnow(void)
   return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-/* /sys/class/infiniband/HCA_NAME/ports/HCA_PORT */
-char *hca_name = "mlx4_0";
-int hca_port = 1;
-
 int umad_fd = -1;
 int umad_agent_id = -1;
 int umad_timeout_ms = 15;
 int umad_retries = 10;
 
-size_t nr_hosts = 0, nr_jobs = 0;
-struct dict job_dict;
-struct dict host_dict;
-struct job_ent **job_list;
-size_t job_list_alloc = 0;
+struct ib_net_db net_db;
 
 struct job_ent {
   uint64_t j_rx_b;
@@ -79,6 +80,14 @@ struct host_ent {
   char h_name[];
 };
 
+size_t nr_hosts = 0, nr_host_slots = 0;
+struct host_ent **host_list = NULL;
+struct dict host_dict;
+
+size_t nr_jobs = 0, nr_job_slots = 0;
+struct job_ent **job_list = NULL;
+struct dict job_dict;
+
 struct host_ent *host_lookup(const char *name, int create)
 {
   struct host_ent *h;
@@ -92,12 +101,35 @@ struct host_ent *host_lookup(const char *name, int create)
   if (!create)
     return NULL;
 
+  if (!(nr_hosts < nr_host_slots)) {
+    size_t new_slots = 2 * nr_host_slots;
+    if (new_slots == 0)
+      new_slots = NR_HOSTS_HINT;
+
+    struct host_ent **new_list = realloc(host_list, new_slots * sizeof(host_list[0]));
+    if (new_list == NULL)
+      OOM();
+
+    host_list = new_list;
+    nr_host_slots = new_slots;
+  }
+
   ALLOC_NAMED(h, h_name, name);
+
+  if (ib_net_db_fetch(&net_db, h->h_name, &h->h_ne) <= 0)
+    goto err;
 
   if (dict_entry_set(&host_dict, de, hash, h->h_name) < 0)
     OOM();
 
+  h->h_trid = TRID_BASE + nr_hosts;
+  host_list[nr_hosts++] = h;
+
   return h;
+
+ err:
+  free(h);
+  return NULL;
 }
 
 int job_cmp(const void *p1, const void *p2)
@@ -130,6 +162,19 @@ struct job_ent *job_lookup(const char *name, const char *owner, int create)
   if (!create)
     return NULL;
 
+  if (!(nr_jobs < nr_job_slots)) {
+    size_t new_slots = 2 * nr_job_slots;
+    if (new_slots == 0)
+      new_slots = NR_JOBS_HINT;
+
+    struct job_ent **new_list = realloc(job_list, new_slots * sizeof(job_list[0]));
+    if (new_list == NULL)
+      OOM();
+
+    job_list = new_list;
+    nr_job_slots = new_slots;
+  }
+
   TRACE("creating job `%s'\n", name);
   ALLOC_NAMED(j, j_name, name);
 
@@ -139,66 +184,90 @@ struct job_ent *job_lookup(const char *name, const char *owner, int create)
   if (dict_entry_set(&job_dict, de, hash, j->j_name) < 0)
     OOM();
 
-  if (!(nr_jobs < job_list_alloc)) {
-    size_t new_alloc = 2 * job_list_alloc;
-    if (new_alloc == 0)
-      new_alloc = 256;
-
-    struct job_ent **new_list = realloc(job_list, new_alloc * sizeof(job_list[0]));
-    if (new_list == NULL)
-      OOM();
-
-    job_list = new_list;
-    job_list_alloc = new_alloc;
-  }
-
   job_list[nr_jobs++] = j;
 
   return j;
 }
 
-int job_map_init(const char *path, int create)
+int job_map_init(const char *path, const char *cmd, int max_age)
 {
   int rc = -1;
   FILE *file = NULL;
   char *line = NULL;
   size_t line_size = 0;
+  int did_try_cmd = 0;
 
-  file = fopen(path, "r");
-  if (file != NULL)
-    goto have_file;
+  while (1) {
+    if (file != NULL)
+      fclose(file);
 
-  if (errno != ENOENT) {
-    ERROR("cannot open `%s': %m\n", path);
-    goto out;
+    file = fopen(path, "r");
+    if (file == NULL && errno != ENOENT) {
+      ERROR("cannot open `%s': %m\n", path);
+      goto out;
+    }
+
+    if (file != NULL && max_age > 0) { /* Check that it's current. */
+      int fd = fileno(file);
+      struct stat stat_buf;
+
+      if (fstat(fd, &stat_buf) < 0) {
+        ERROR("cannot stat `%s': %m\n", path);
+        goto out;
+      }
+
+      if (!S_ISREG(stat_buf.st_mode))
+        goto have_file; /* Maybe a pipe of fifo, assume OK. */
+
+      double now = dnow();
+      TRACE("job map age %f, max age %d\n",
+            now - stat_buf.st_mtime, max_age);
+
+      if (now <= stat_buf.st_mtime + max_age)
+        goto have_file;
+
+      ERROR("`%s' is more than %d seconds old, running `%s'\n",
+            path, max_age, cmd);
+    }
+
+    if (did_try_cmd || cmd == NULL)
+      goto out;
+
+    did_try_cmd = 1;
+
+    int cmd_st = system(cmd);
+    if (cmd_st < 0) {
+      ERROR("cannot execute `%s': %m\n", cmd);
+      goto out;
+    }
+
+    if (WIFEXITED(cmd_st) && WEXITSTATUS(cmd_st) == 0) {
+      TRACE("command `%s' exited with status 0\n", cmd); /* ... */
+    } else {
+      ERROR("command `%s' terminated with wait status: %d\n", cmd, cmd_st); /* ... */
+      goto out;
+    }
   }
-
-  if (!create) {
-    rc = 0;
-    goto out;
-  }
-
-  /* TODO system(IBTOP_JOB_MAP_CMD). */
 
  have_file:
   while (getline(&line, &line_size, file) >= 0) {
     char *rest = line;
-    char *host_name = wsep(&rest);
-    char *job_name = wsep(&rest);
-    char *owner = wsep(&rest);
-    if (host_name == NULL || job_name == NULL || owner == NULL)
+    char *h_name = wsep(&rest);
+    char *j_name = wsep(&rest);
+    char *j_owner = wsep(&rest);
+    if (h_name == NULL || j_name == NULL || j_owner == NULL)
       continue;
 
-    struct host_ent *h = host_lookup(host_name, 0);
+    struct host_ent *h = host_lookup(h_name, 0);
     if (h == NULL)
       continue;
 
-    struct job_ent *job = job_lookup(job_name, owner, 1);
-    if (job == NULL)
+    struct job_ent *j = job_lookup(j_name, j_owner, 1);
+    if (j == NULL)
       OOM();
 
-    job->j_nr_hosts++;
-    h->h_job = job;
+    j->j_nr_hosts++;
+    h->h_job = j;
   }
 
   rc = 0;
@@ -210,21 +279,9 @@ int job_map_init(const char *path, int create)
   return rc;
 }
 
-struct host_ent *host_ent_create(struct ib_net_db *nd, const char *name, size_t i)
+static inline void ibtop_umad_dump(void *um, size_t len)
 {
-  struct host_ent *h = host_lookup(name, 1);
-
-  h->h_trid = TRID_BASE + i;
-
-  if (ib_net_db_fetch(nd, h->h_name, &h->h_ne) <= 0)
-    /* XXX */;
-
-  return h;
-}
-
-static inline void dump_umad(void *um, size_t len)
-{
-#ifdef DEBUG
+#ifdef IBTOP_UMAD_DEBUG
   unsigned char *p = um;
   unsigned int i, j;
 
@@ -280,7 +337,7 @@ int host_send_perf_umad(struct host_ent *h)
         h->h_name, h->h_ne.ne_lid, h->h_ne.ne_port,
         (unsigned int) h->h_ne.ne_is_hca, h->h_trid);
 
-  dump_umad(um, um_size);
+  ibtop_umad_dump(um, um_size);
 
   ssize_t nw = write(umad_fd, um, um_size);
   if (nw < 0) {
@@ -312,7 +369,7 @@ int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
 
   TRACE("received umad trid "P_TRID", status %d\n", trid, um->status);
 
-  dump_umad(buf, nr);
+  ibtop_umad_dump(buf, nr);
 
   if (mad_get_field(m, 0, IB_DRSMP_STATUS_F) == IB_MAD_STS_REDIRECT) {
     /* FIXME */
@@ -366,20 +423,28 @@ int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
 
 int main(int argc, char *argv[])
 {
+  const char *net_db_path = IBTOP_NET_DB_PATH;
+  const char *net_disc_cmd = IBTOP_NET_DISC_CMD;
   const char *job_map_path = IBTOP_JOB_MAP_PATH;
-  struct host_ent **host_list = NULL;
+  const char *job_map_cmd = IBTOP_JOB_MAP_CMD;
+  int job_map_max_age = IBTOP_JOB_MAP_MAX_AGE; /* Use -1 for never. */
+  double interval = 1;
   size_t i;
-  double interval = 10;
-  struct ib_net_db nd;
 
   struct option opts[] = {
-    { "interval", 1, NULL, 'i' },
-    { "job-map",  1, NULL, 'j' },
+    { "interval",        1, NULL, 'i' },
+    { "job-map",         1, NULL, 'j' },
+    { "job-map-cmd",     1, NULL, 'J' },
+    { "job-map-max-age", 1, NULL, 'm' },
+    { "net-db",          1, NULL, 'n' },
+    { "net-disc-cmd",    1, NULL, 'N' },
     { NULL, 0, NULL, 0},
   };
 
+#define STRN(s) (strcmp((s), "NONE") != 0 ? (s) : NULL)
+
   int c;
-  while ((c = getopt_long(argc, argv, "i:j:", opts, 0)) != -1) {
+  while ((c = getopt_long(argc, argv, "i:j:J:m:n:N:", opts, 0)) != -1) {
     switch (c) {
     case 'i':
       interval = strtod(optarg, NULL);
@@ -387,7 +452,19 @@ int main(int argc, char *argv[])
         FATAL("invalid interval `%s'\n", optarg);
       break;
     case 'j':
-      job_map_path = strcmp(optarg, "NONE") != 0 ? optarg : NULL;
+      job_map_path = STRN(optarg);
+      break;
+    case 'J':
+      job_map_cmd = STRN(optarg);
+      break;
+    case 'm':
+      job_map_max_age = atoi(optarg);
+      break;
+    case 'n':
+      net_db_path = optarg;
+      break;
+    case 'N':
+      net_disc_cmd = optarg;
       break;
     case '?':
       fprintf(stderr, "Try `%s --help' for more information.",
@@ -402,56 +479,36 @@ int main(int argc, char *argv[])
   if (dict_init(&host_dict, NR_HOSTS_HINT) < 0)
     OOM();
 
-  if (ib_net_db_open(&nd, NULL, 0, 0) < 0)
+  if (ib_net_db_open(&net_db, net_db_path, net_disc_cmd, 0, 0) < 0)
     FATAL("cannot open IB net DB\n");
 
   if (argc > optind) {
-    size_t nr_host_args = argc - optind;
-    host_list = calloc(nr_host_args, sizeof(host_list[0]));
-
-    for (i = 0; i < nr_host_args; i++) {
+    for (i = 0; i < argc - optind; i++) {
       char *name = argv[optind + i];
-      struct host_ent *h = host_ent_create(&nd, name, nr_hosts);
-
-      if (h == NULL) {
+      if (host_lookup(name, 1) == NULL)
         ERROR("unknown host `%s'\n", name);
-        continue;
-      }
-
-      host_list[nr_hosts++] = h;
     }
-
-    if (nr_hosts == 0)
-      FATAL("no good hosts out of %zu\n", nr_host_args);
   } else {
     char *name = NULL;
     size_t name_size = 0;
 
-    host_list = calloc(nd.nd_count, sizeof(host_list[0]));
-
-    while (nr_hosts < nd.nd_count) {
-      ib_net_db_iter(&nd, &name, &name_size);
-      if (name == NULL)
-        break;
-
-      struct host_ent *h = host_ent_create(&nd, name, nr_hosts);
-
-      if (h == NULL) {
+    while (ib_net_db_iter(&net_db, &name, &name_size) > 0) {
+      if (host_lookup(name, 1) == NULL)
         ERROR("unknown host `%s'\n", name);
-        continue;
-      }
-
-      host_list[nr_hosts++] = h;
     }
 
     free(name);
   }
 
-  ib_net_db_close(&nd);
+  ib_net_db_close(&net_db);
 
-  job_map_init(job_map_path, 1);
+  if (nr_hosts == 0)
+    FATAL("no valid hosts\n");
 
-#ifdef DEBUG
+  if (job_map_path != NULL)
+    job_map_init(job_map_path, job_map_cmd, job_map_max_age);
+
+#ifdef IBTOP_UMAD_DEBUG
   umad_debug(9);
 #endif
 
@@ -473,14 +530,11 @@ int main(int argc, char *argv[])
 
   int which;
   for (which = 0; which < 2; which++) {
-
     size_t nr_sent = 0, nr_responses = 0;
 
     start[which] = dnow();
 
     for (i = 0; i < nr_hosts; i++) {
-      if (host_list[i] == NULL)
-        continue;
       if (host_send_perf_umad(host_list[i]) < 0)
         continue;
       nr_sent++;

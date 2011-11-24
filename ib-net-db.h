@@ -8,7 +8,6 @@
 
 struct ib_net_db {
   void *nd_db;
-  size_t nd_count;
 };
 
 struct ib_net_ent {
@@ -19,11 +18,12 @@ struct ib_net_ent {
 };
 
 /* Flags are GDBM_FLAGS.  Readers should use 0. */
-int ib_net_db_open(struct ib_net_db *nd, const char *path, int flags, mode_t mode);
+int ib_net_db_open(struct ib_net_db *nd, const char *path, const char *disc,
+                   int flags, mode_t mode);
 int ib_net_db_store(struct ib_net_db *nd, const char *host, const struct ib_net_ent *ne);
 int ib_net_db_fetch(struct ib_net_db *nd, const char *host, struct ib_net_ent *ne);
 int ib_net_db_fill(struct ib_net_db *nd, FILE *file, const char *path);
-void ib_net_db_iter(struct ib_net_db *nd, char **name, size_t *size);
+int ib_net_db_iter(struct ib_net_db *nd, char **name, size_t *size);
 void ib_net_db_close(struct ib_net_db *nd);
 
 #endif

@@ -18,7 +18,7 @@ int main(int argc, char *argv[])
   if (argc > 2)
     db_path = argv[2];
 
-  if (ib_net_db_open(&nd, db_path, GDBM_NEWDB, 0666) < 0)
+  if (ib_net_db_open(&nd, db_path, NULL, GDBM_NEWDB, 0666) < 0)
     exit(EXIT_FAILURE);
 
   ib_net_db_fill(&nd, NULL, disc_path);
