@@ -11,12 +11,11 @@
 #include <sys/stat.h>
 #include <infiniband/umad.h>
 #include <infiniband/mad.h>
-#include "ib-net-db.h"
 #include "string1.h"
 #include "trace.h"
 #include "dict.h"
 
-#define IBTOP_NET_DB_PATH "/var/run/ibtop-net-db"
+#define IBTOP_NET_INFO_PATH "/var/run/ibtop-net-info"
 #define IBTOP_NET_DISC_CMD "/opt/ofed/sbin/ibnetdiscover"
 #define IBTOP_JOB_MAP_PATH "/var/run/ibtop-job-map"
 #define IBTOP_JOB_MAP_CMD "/opt/ibtop/make-job-map"
@@ -30,6 +29,12 @@
 
 char *hca_name = "mlx4_0";
 int hca_port = 1;
+
+struct ib_net_info {
+  uint16_t ni_lid;
+  uint8_t ni_port;
+  unsigned int ni_is_hca:1;
+};
 
 #define GET_NAMED(ptr,member,name) \
   (ptr) = (typeof(ptr)) (((char *) name) - offsetof(typeof(*ptr), member))
@@ -56,36 +61,36 @@ int umad_agent_id = -1;
 int umad_timeout_ms = 15;
 int umad_retries = 10;
 
-struct ib_net_db net_db;
+enum {
+  C_TX_B,
+  C_RX_B,
+  C_TX_P,
+  C_RX_P,
+  NR_CTRS,
+};
 
 struct job_ent {
-  uint64_t j_rx_b;
-  uint64_t j_rx_p;
-  uint64_t j_tx_b;
-  uint64_t j_tx_p;
+  uint64_t j_ctrs[NR_CTRS];
   char *j_owner;
   size_t j_nr_hosts;
   char j_name[];
 };
 
 struct host_ent {
-  struct ib_net_ent h_ne;
+  uint64_t h_ctrs[NR_CTRS];
   uint64_t h_trid;
-  uint64_t h_rx_b;
-  uint64_t h_rx_p;
-  uint64_t h_tx_b;
-  uint64_t h_tx_p;
   struct job_ent *h_job;
+  struct ib_net_info h_info;
   unsigned int h_valid:2;
   char h_name[];
 };
 
-size_t nr_hosts = 0, nr_host_slots = 0;
-struct host_ent **host_list = NULL;
+size_t nr_hosts = 0, host_vec_len = 0;
+struct host_ent **host_vec = NULL;
 struct dict host_dict;
 
 size_t nr_jobs = 0, nr_job_slots = 0;
-struct job_ent **job_list = NULL;
+struct job_ent **job_vec = NULL;
 struct dict job_dict;
 
 struct host_ent *host_lookup(const char *name, int create)
@@ -101,52 +106,80 @@ struct host_ent *host_lookup(const char *name, int create)
   if (!create)
     return NULL;
 
-  if (!(nr_hosts < nr_host_slots)) {
-    size_t new_slots = 2 * nr_host_slots;
-    if (new_slots == 0)
-      new_slots = NR_HOSTS_HINT;
+  if (!(nr_hosts < host_vec_len)) {
+    size_t new_len = 2 * host_vec_len;
+    if (new_len == 0)
+      new_len = NR_HOSTS_HINT;
 
-    struct host_ent **new_list = realloc(host_list, new_slots * sizeof(host_list[0]));
-    if (new_list == NULL)
+    struct host_ent **new_vec = realloc(host_vec, new_len * sizeof(host_vec[0]));
+    if (new_vec == NULL)
       OOM();
 
-    host_list = new_list;
-    nr_host_slots = new_slots;
+    host_vec = new_vec;
+    host_vec_len = new_len;
   }
 
   ALLOC_NAMED(h, h_name, name);
-
-  if (ib_net_db_fetch(&net_db, h->h_name, &h->h_ne) <= 0)
-    goto err;
 
   if (dict_entry_set(&host_dict, de, hash, h->h_name) < 0)
     OOM();
 
   h->h_trid = TRID_BASE + nr_hosts;
-  host_list[nr_hosts++] = h;
+  host_vec[nr_hosts++] = h;
 
   return h;
+}
 
- err:
-  free(h);
-  return NULL;
+int host_vec_init(FILE *file)
+{
+  char *line = NULL;
+  size_t line_size = 0;
+
+  while (getline(&line, &line_size, file) >= 0) {
+    char *rest = line;
+    char *host = wsep(&rest);
+    int use_hca;
+    uint16_t hca_lid, sw_lid;
+    uint8_t hca_port, sw_port;
+    struct host_ent *h;
+
+    if (sscanf(rest, "%d %*x %"SCNx16" %"SCNx8" %*x %"SCNx16" %"SCNx8,
+	       &use_hca, &hca_lid, &hca_port, &sw_lid, &sw_port) != 5)
+      continue;
+
+    h = host_lookup(host, 1);
+    if (h == NULL)
+      OOM();
+
+    if (use_hca) {
+      h->h_info->ni_lid = hca_lid;
+      h->h_info->ni_port = hca_port;
+      h->h_info->ni_is_hca = 1;
+    } else {
+      h->h_info->ni_lid = sw_lid;
+      h->h_info->ni_port = sw_port;
+    }
+  }
+
+  free(line);
+
+  return 0;
 }
 
 int job_cmp(const void *p1, const void *p2)
 {
-  struct job_ent *j1 = *(struct job_ent **) p1;
-  struct job_ent *j2 = *(struct job_ent **) p2;
+  uint64_t *c1 = (*(struct job_ent **) p1)->j_ctrs;
+  uint64_t *c2 = (*(struct job_ent **) p2)->j_ctrs;
 
-  if (j1->j_tx_b > j2->j_tx_b)
-    return -1;
-  else if (j1->j_tx_b < j2->j_tx_b)
-    return 1;
-  else if (j1->j_rx_b > j2->j_rx_b)
-    return -1;
-  else if (j1->j_rx_b < j2->j_rx_b)
-    return 1;
-  else
-    return 0;
+  int k;
+  for (k = 0; k < NR_CTRS; k++) {
+    if (c1[k] > c2[k])
+      return -1;
+    else if (c1[k] < c2[k])
+      return 1;
+  }
+
+  return 0;
 }
 
 struct job_ent *job_lookup(const char *name, const char *owner, int create)
@@ -162,17 +195,17 @@ struct job_ent *job_lookup(const char *name, const char *owner, int create)
   if (!create)
     return NULL;
 
-  if (!(nr_jobs < nr_job_slots)) {
-    size_t new_slots = 2 * nr_job_slots;
-    if (new_slots == 0)
-      new_slots = NR_JOBS_HINT;
+  if (!(nr_jobs < job_vec_len)) {
+    size_t new_len = 2 * job_vec_len;
+    if (new_len == 0)
+      new_len = NR_JOBS_HINT;
 
-    struct job_ent **new_list = realloc(job_list, new_slots * sizeof(job_list[0]));
-    if (new_list == NULL)
+    struct job_ent **new_vec = realloc(job_vec, new_len * sizeof(job_vec[0]));
+    if (new_vec == NULL)
       OOM();
 
-    job_list = new_list;
-    nr_job_slots = new_slots;
+    job_vec = new_vec;
+    job_vec_len = new_len;
   }
 
   TRACE("creating job `%s'\n", name);
@@ -184,7 +217,7 @@ struct job_ent *job_lookup(const char *name, const char *owner, int create)
   if (dict_entry_set(&job_dict, de, hash, j->j_name) < 0)
     OOM();
 
-  job_list[nr_jobs++] = j;
+  job_vec[nr_jobs++] = j;
 
   return j;
 }
@@ -310,7 +343,7 @@ int host_send_perf_umad(struct host_ent *h)
   memset(buf, 0, sizeof(buf));
 
   um = (struct ib_user_mad *) buf;
-  umad_set_addr(um, h->h_ne.ne_lid, 1, 0, IB_DEFAULT_QP1_QKEY);
+  umad_set_addr(um, h->h_info.ni_lid, 1, 0, IB_DEFAULT_QP1_QKEY);
 
   um->agent_id   = umad_agent_id;
   um->timeout_ms = umad_timeout_ms;
@@ -330,12 +363,12 @@ int host_send_perf_umad(struct host_ent *h)
   mad_set_field64(m, 0, IB_MAD_TRID_F, h->h_trid);
 
   void *pc = (char *) m + IB_PC_DATA_OFFS;
-  mad_set_field(pc, 0, IB_PC_PORT_SELECT_F, h->h_ne.ne_port);
+  mad_set_field(pc, 0, IB_PC_PORT_SELECT_F, h->h_info.ni_port);
 
   TRACE("sending perf umad for host `%s', "
         "lid %"PRIx16", port %"PRIx8", is_hca %u, trid "P_TRID"\n",
-        h->h_name, h->h_ne.ne_lid, h->h_ne.ne_port,
-        (unsigned int) h->h_ne.ne_is_hca, h->h_trid);
+        h->h_name, h->h_info.ni_lid, h->h_info.ni_port,
+        (unsigned int) h->h_info.ni_is_hca, h->h_trid);
 
   ibtop_umad_dump(um, um_size);
 
@@ -350,7 +383,7 @@ int host_send_perf_umad(struct host_ent *h)
   return 0;
 }
 
-int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
+int recv_response_umad(int which)
 {
   char buf[1024];
   memset(buf, 0, sizeof(buf));
@@ -390,32 +423,32 @@ int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
     return -1;
   }
 
-  struct host_ent *h = host_list[i];
+  struct host_ent *h = host_vec[i];
   if (h == NULL) {
     ERROR("no host for umad, trid "P_TRID"\n", trid);
     return -1;
   }
 
-  unsigned int is_hca = h->h_ne.ne_is_hca;
+  unsigned int is_hca = h->h_info.ni_is_hca;
 
   TRACE("host `%s', lid %"PRIx16", port %"PRIx8", is_hca %u\n",
-        h->h_name, h->h_ne.ne_lid, h->h_ne.ne_port, is_hca);
+        h->h_name, h->h_info.ni_lid, h->h_info.ni_port, is_hca);
 
   void *pc = (char *) m + IB_PC_DATA_OFFS;
-  uint64_t rx_b, rx_p, tx_b, tx_p;
+  uint64_t c[NR_CTRS];
 
-  mad_decode_field(pc, IB_PC_EXT_RCV_BYTES_F, is_hca ? &rx_b : &tx_b);
-  mad_decode_field(pc, IB_PC_EXT_RCV_PKTS_F,  is_hca ? &rx_p : &tx_p);
-  mad_decode_field(pc, IB_PC_EXT_XMT_BYTES_F, is_hca ? &tx_b : &rx_b);
-  mad_decode_field(pc, IB_PC_EXT_XMT_PKTS_F,  is_hca ? &tx_p : &rx_p);
+  mad_decode_field(pc, IB_PC_EXT_RCV_BYTES_F, &c[is_hca ? C_RX_B : C_TX_B]);
+  mad_decode_field(pc, IB_PC_EXT_RCV_PKTS_F,  &c[is_hca ? C_RX_P : C_TX_P]);
+  mad_decode_field(pc, IB_PC_EXT_XMT_BYTES_F, &c[is_hca ? C_TX_B : C_RX_B]);
+  mad_decode_field(pc, IB_PC_EXT_XMT_PKTS_F,  &c[is_hca ? C_TX_P : C_RX_P]);
 
   TRACE("rx_b %"PRIx64", rx_p %"PRIx64", tx_b %"PRIx64", tx_p %"PRIx64"\n",
-        rx_b, rx_p, tx_b, tx_p);
+        c[C_RX_B], c[C_RX_P], c[C_TX_B], c[C_TX_P]);
 
-  h->h_rx_b += which == 0 ? -rx_b : rx_b;
-  h->h_rx_p += which == 0 ? -rx_p : rx_p;
-  h->h_tx_b += which == 0 ? -tx_b : tx_b;
-  h->h_tx_p += which == 0 ? -tx_p : tx_p;
+  int k;
+  for (k = 0; k < NR_CTRS; k++)
+    h->h_ctrs[k] += which == 0 ? -c[k] : c[k];
+
   h->h_valid |= 1u << which;
 
   return 0;
@@ -423,8 +456,9 @@ int recv_response_umad(int which, struct host_ent **host_list, size_t nr_hosts)
 
 int main(int argc, char *argv[])
 {
-  const char *net_db_path = IBTOP_NET_DB_PATH;
+  const char *net_info_path = IBTOP_NET_INFO_PATH;
   const char *net_disc_cmd = IBTOP_NET_DISC_CMD;
+  FILE *net_info_file = NULL;
   const char *job_map_path = IBTOP_JOB_MAP_PATH;
   const char *job_map_cmd = IBTOP_JOB_MAP_CMD;
   int job_map_max_age = IBTOP_JOB_MAP_MAX_AGE; /* Use -1 for never. */
@@ -436,7 +470,7 @@ int main(int argc, char *argv[])
     { "job-map",         1, NULL, 'j' },
     { "job-map-cmd",     1, NULL, 'J' },
     { "job-map-max-age", 1, NULL, 'm' },
-    { "net-db",          1, NULL, 'n' },
+    { "net-info",        1, NULL, 'n' },
     { "net-disc-cmd",    1, NULL, 'N' },
     { NULL, 0, NULL, 0},
   };
@@ -461,7 +495,7 @@ int main(int argc, char *argv[])
       job_map_max_age = atoi(optarg);
       break;
     case 'n':
-      net_db_path = optarg;
+      net_info_path = optarg;
       break;
     case 'N':
       net_disc_cmd = optarg;
@@ -473,34 +507,20 @@ int main(int argc, char *argv[])
     }
   }
 
-  if (dict_init(&job_dict, NR_JOBS_HINT) < 0)
-    OOM();
-
   if (dict_init(&host_dict, NR_HOSTS_HINT) < 0)
     OOM();
 
-  if (ib_net_db_open(&net_db, net_db_path, net_disc_cmd, 0, 0) < 0)
-    FATAL("cannot open IB net DB\n");
+  if (dict_init(&job_dict, NR_JOBS_HINT) < 0)
+    OOM();
 
-  if (argc > optind) {
-    for (i = 0; i < argc - optind; i++) {
-      char *name = argv[optind + i];
-      if (host_lookup(name, 1) == NULL)
-        ERROR("unknown host `%s'\n", name);
-    }
-  } else {
-    char *name = NULL;
-    size_t name_size = 0;
+  net_info_file = fopen(net_info_path, "r");
+  if (net_info_file == NULL)
+    FATAL("cannot open `%s': %m\n", net_info_path);
 
-    while (ib_net_db_iter(&net_db, &name, &name_size) > 0) {
-      if (host_lookup(name, 1) == NULL)
-        ERROR("unknown host `%s'\n", name);
-    }
+  if (host_vec_init(net_info_file) < 0)
+    FATAL("failed to initialize host vector\n");
 
-    free(name);
-  }
-
-  ib_net_db_close(&net_db);
+  fclose(net_info_file);
 
   if (nr_hosts == 0)
     FATAL("no valid hosts\n");
@@ -535,7 +555,7 @@ int main(int argc, char *argv[])
     start[which] = dnow();
 
     for (i = 0; i < nr_hosts; i++) {
-      if (host_send_perf_umad(host_list[i]) < 0)
+      if (host_send_perf_umad(host_vec[i]) < 0)
         continue;
       nr_sent++;
     }
@@ -561,7 +581,7 @@ int main(int argc, char *argv[])
         break;
       }
 
-      if (recv_response_umad(which, host_list, nr_hosts) < 0)
+      if (recv_response_umad(which, host_vec, nr_hosts) < 0)
         continue;
 
       nr_responses++;
@@ -575,7 +595,7 @@ int main(int argc, char *argv[])
   }
 
   for (i = 0; i < nr_hosts; i++) {
-    struct host_ent *h = host_list[i];
+    struct host_ent *h = host_vec[i];
     struct job_ent *j = h->h_job;
 
     if (h->h_valid != 3)
@@ -587,28 +607,27 @@ int main(int argc, char *argv[])
       j->j_nr_hosts++;
     }
 
-    j->j_rx_b += h->h_rx_b;
-    j->j_rx_p += h->h_rx_p;
-    j->j_tx_b += h->h_tx_b;
-    j->j_tx_p += h->h_tx_p;
+    int k;
+    for (k = 0; k < NR_CTRS; k++)
+      j->j_ctrs[k] += h->h_ctrs[k];
   }
 
-  qsort(job_list, nr_jobs, sizeof(job_list[0]), &job_cmp);
+  qsort(job_vec, nr_jobs, sizeof(job_vec[0]), &job_cmp);
 
   /* Omit packet counters for now. */
   printf("%-12s %12s %12s %8s %-12s\n",
          "JOBID", "TX_MB/S", "RX_MB/S", "NR_HOSTS", "OWNER");
 
   for (i = 0; i < nr_jobs; i++) {
-    struct job_ent *j = job_list[i];
+    struct job_ent *j = job_vec[i];
 
-    double rx_mbs = j->j_rx_b / interval / 1048576;
-    /* double rx_ps = j->j_rx_p / interval; */
-    double tx_mbs = j->j_tx_b / interval / 1048576;
-    /* double tx_ps = j->j_tx_p / interval; */
+    double rx_mbps = j->j_ctrs[C_RX_B] / interval / 1048576;
+    /* double rx_ps = j->j_ctrs[C_RX_P] / interval; */
+    double tx_mbps = j->j_ctrs[C_TX_B] / interval / 1048576;
+    /* double tx_ps = j->j_ctrs[C_TX_P] / interval; */
 
     printf("%-12s %12.3f %12.3f %8zu %-12s\n",
-           j->j_name, tx_mbs, rx_mbs, j->j_nr_hosts,
+           j->j_name, tx_mbps, rx_mbps, j->j_nr_hosts,
            j->j_owner != NULL ? j->j_owner : "-");
   }
 
