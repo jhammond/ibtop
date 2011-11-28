@@ -14,12 +14,8 @@
 #include "string1.h"
 #include "trace.h"
 #include "dict.h"
-
-#define IBTOP_NET_INFO_PATH "/var/run/ibtop-net-info"
-#define IBTOP_NET_DISC_CMD "/opt/ofed/sbin/ibnetdiscover"
-#define IBTOP_JOB_MAP_PATH "/var/run/ibtop-job-map"
-#define IBTOP_JOB_MAP_CMD "/opt/ibtop/make-job-map"
-#define IBTOP_JOB_MAP_MAX_AGE 180
+#include "list.h"
+#include "ibtop.h"
 
 #define NR_JOBS_HINT 256
 #define NR_HOSTS_HINT 4096
@@ -72,6 +68,7 @@ enum {
 struct job_ent {
   uint64_t j_ctrs[NR_CTRS];
   char *j_owner;
+  struct list_head j_host_list;
   size_t j_nr_hosts;
   char j_name[];
 };
@@ -80,6 +77,7 @@ struct host_ent {
   uint64_t h_ctrs[NR_CTRS];
   uint64_t h_trid;
   struct job_ent *h_job;
+  struct list_head h_job_link;
   struct ib_net_info h_info;
   unsigned int h_valid:2;
   char h_name[];
@@ -89,7 +87,7 @@ size_t nr_hosts = 0, host_vec_len = 0;
 struct host_ent **host_vec = NULL;
 struct dict host_dict;
 
-size_t nr_jobs = 0, nr_job_slots = 0;
+size_t nr_jobs = 0, job_vec_len = 0;
 struct job_ent **job_vec = NULL;
 struct dict job_dict;
 
@@ -108,9 +106,6 @@ struct host_ent *host_lookup(const char *name, int create)
 
   if (!(nr_hosts < host_vec_len)) {
     size_t new_len = 2 * host_vec_len;
-    if (new_len == 0)
-      new_len = NR_HOSTS_HINT;
-
     struct host_ent **new_vec = realloc(host_vec, new_len * sizeof(host_vec[0]));
     if (new_vec == NULL)
       OOM();
@@ -120,6 +115,7 @@ struct host_ent *host_lookup(const char *name, int create)
   }
 
   ALLOC_NAMED(h, h_name, name);
+  INIT_LIST_HEAD(&h->h_job_link);
 
   if (dict_entry_set(&host_dict, de, hash, h->h_name) < 0)
     OOM();
@@ -130,12 +126,45 @@ struct host_ent *host_lookup(const char *name, int create)
   return h;
 }
 
-int host_vec_init(FILE *file)
+int host_vec_init(const char *info_path, const char *info_cmd)
 {
+  int rc = -1;
+  FILE *info_file = NULL;
   char *line = NULL;
   size_t line_size = 0;
 
-  while (getline(&line, &line_size, file) >= 0) {
+  info_file = fopen(info_path, "r");
+  if (info_file != NULL)
+    goto have_info_file;
+
+  if (errno != ENOENT) {
+    ERROR("cannot open `%s': %m\n", info_path);
+    goto out;
+  }
+
+  ERROR("cannot open `%s', running `%s'\n", info_path, info_cmd);
+
+  int st = system(info_cmd);
+  if (st < 0) {
+    ERROR("cannot execute `%s': %m\n", info_cmd);
+    goto out;
+  }
+
+  if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+    TRACE("command `%s' exited with status 0\n", info_cmd); /* ... */
+  } else {
+    ERROR("command `%s' terminated with wait status: %d\n", info_cmd, st); /* ... */
+    goto out;
+  }
+
+  info_file = fopen(info_path, "r");
+  if (info_file == NULL) {
+    ERROR("cannot open `%s': %m\n", info_path);
+    goto out;
+  }
+
+ have_info_file:
+  while (getline(&line, &line_size, info_file) >= 0) {
     char *rest = line;
     char *host = wsep(&rest);
     int use_hca;
@@ -144,7 +173,7 @@ int host_vec_init(FILE *file)
     struct host_ent *h;
 
     if (sscanf(rest, "%d %*x %"SCNx16" %"SCNx8" %*x %"SCNx16" %"SCNx8,
-	       &use_hca, &hca_lid, &hca_port, &sw_lid, &sw_port) != 5)
+               &use_hca, &hca_lid, &hca_port, &sw_lid, &sw_port) != 5)
       continue;
 
     h = host_lookup(host, 1);
@@ -152,18 +181,22 @@ int host_vec_init(FILE *file)
       OOM();
 
     if (use_hca) {
-      h->h_info->ni_lid = hca_lid;
-      h->h_info->ni_port = hca_port;
-      h->h_info->ni_is_hca = 1;
+      h->h_info.ni_lid = hca_lid;
+      h->h_info.ni_port = hca_port;
+      h->h_info.ni_is_hca = 1;
     } else {
-      h->h_info->ni_lid = sw_lid;
-      h->h_info->ni_port = sw_port;
+      h->h_info.ni_lid = sw_lid;
+      h->h_info.ni_port = sw_port;
     }
   }
 
+  rc = 0;
+ out:
   free(line);
+  if (info_file != NULL)
+    fclose(info_file);
 
-  return 0;
+  return rc;
 }
 
 int job_cmp(const void *p1, const void *p2)
@@ -197,9 +230,6 @@ struct job_ent *job_lookup(const char *name, const char *owner, int create)
 
   if (!(nr_jobs < job_vec_len)) {
     size_t new_len = 2 * job_vec_len;
-    if (new_len == 0)
-      new_len = NR_JOBS_HINT;
-
     struct job_ent **new_vec = realloc(job_vec, new_len * sizeof(job_vec[0]));
     if (new_vec == NULL)
       OOM();
@@ -210,6 +240,7 @@ struct job_ent *job_lookup(const char *name, const char *owner, int create)
 
   TRACE("creating job `%s'\n", name);
   ALLOC_NAMED(j, j_name, name);
+  INIT_LIST_HEAD(&j->j_host_list);
 
   if (owner != NULL)
     j->j_owner = strdup(owner);
@@ -220,6 +251,24 @@ struct job_ent *job_lookup(const char *name, const char *owner, int create)
   job_vec[nr_jobs++] = j;
 
   return j;
+}
+
+int do_job_map_cmd(const char *cmd)
+{
+  int st = system(cmd);
+  if (st < 0) {
+    ERROR("cannot execute `%s': %m\n", cmd);
+    return -1;
+  }
+
+  if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+    TRACE("command `%s' exited with status 0\n", cmd);
+  } else {
+    ERROR("command `%s' terminated with wait status: %d\n", cmd, st);
+    return -1;
+  }
+
+  return 0;
 }
 
 int job_map_init(const char *path, const char *cmd, int max_age)
@@ -235,51 +284,57 @@ int job_map_init(const char *path, const char *cmd, int max_age)
       fclose(file);
 
     file = fopen(path, "r");
-    if (file == NULL && errno != ENOENT) {
-      ERROR("cannot open `%s': %m\n", path);
-      goto out;
-    }
-
-    if (file != NULL && max_age > 0) { /* Check that it's current. */
-      int fd = fileno(file);
-      struct stat stat_buf;
-
-      if (fstat(fd, &stat_buf) < 0) {
-        ERROR("cannot stat `%s': %m\n", path);
+    if (file == NULL) {
+      if (errno != ENOENT || cmd == NULL) {
+        ERROR("cannot open `%s': %m\n", path);
         goto out;
       }
 
-      if (!S_ISREG(stat_buf.st_mode))
-        goto have_file; /* Maybe a pipe of fifo, assume OK. */
+      if (did_try_cmd)
+        goto out;
 
-      double now = dnow();
-      TRACE("job map age %f, max age %d\n",
-            now - stat_buf.st_mtime, max_age);
+      ERROR("cannot open `%s', running `%s'\n", path, cmd);
 
-      if (now <= stat_buf.st_mtime + max_age)
-        goto have_file;
+      did_try_cmd = 1;
+      if (do_job_map_cmd(cmd) < 0)
+        goto out;
 
-      ERROR("`%s' is more than %d seconds old, running `%s'\n",
-            path, max_age, cmd);
+      file = fopen(path, "r");
+      if (file == NULL) {
+        ERROR("cannot open `%s': %m\n", path);
+        goto out;
+      }
     }
 
-    if (did_try_cmd || cmd == NULL)
+    if (max_age < 0)
+      goto have_file;
+
+    /* Check that it's current. */
+    struct stat stat_buf;
+    if (fstat(fileno(file), &stat_buf) < 0) {
+      ERROR("cannot stat `%s': %m\n", path);
       goto out;
+    }
+
+    if (!S_ISREG(stat_buf.st_mode))
+      goto have_file; /* Maybe a pipe or fifo, assume OK. */
+
+    double now = dnow();
+    TRACE("job map age %f, max age %d\n",
+          now - stat_buf.st_mtime, max_age);
+
+    if (now <= stat_buf.st_mtime + max_age)
+      goto have_file;
+
+    if (did_try_cmd)
+      goto out;
+
+    ERROR("`%s' is more than %d seconds old, running `%s'\n",
+          path, max_age, cmd);
 
     did_try_cmd = 1;
-
-    int cmd_st = system(cmd);
-    if (cmd_st < 0) {
-      ERROR("cannot execute `%s': %m\n", cmd);
+    if (do_job_map_cmd(cmd) < 0)
       goto out;
-    }
-
-    if (WIFEXITED(cmd_st) && WEXITSTATUS(cmd_st) == 0) {
-      TRACE("command `%s' exited with status 0\n", cmd); /* ... */
-    } else {
-      ERROR("command `%s' terminated with wait status: %d\n", cmd, cmd_st); /* ... */
-      goto out;
-    }
   }
 
  have_file:
@@ -299,12 +354,15 @@ int job_map_init(const char *path, const char *cmd, int max_age)
     if (j == NULL)
       OOM();
 
+    list_add(&h->h_job_link, &j->j_host_list);
     j->j_nr_hosts++;
     h->h_job = j;
   }
 
   rc = 0;
+
  out:
+
   free(line);
   if (file != NULL)
     fclose(file);
@@ -445,6 +503,14 @@ int recv_response_umad(int which)
   TRACE("rx_b %"PRIx64", rx_p %"PRIx64", tx_b %"PRIx64", tx_p %"PRIx64"\n",
         c[C_RX_B], c[C_RX_P], c[C_TX_B], c[C_TX_P]);
 
+  if (c[C_RX_B] == 0 || c[C_RX_B] == (uint64_t) -1 ||
+      c[C_TX_B] == 0 || c[C_TX_B] == (uint64_t) -1) {
+    ERROR("perfquery for host `%s' returned bogus stats: "
+          "rx_b %"PRIx64", rx_p %"PRIx64", tx_b %"PRIx64", tx_p %"PRIx64"\n",
+          h->h_name, c[C_RX_B], c[C_RX_P], c[C_TX_B], c[C_TX_P]);
+    return -1;
+  }
+
   int k;
   for (k = 0; k < NR_CTRS; k++)
     h->h_ctrs[k] += which == 0 ? -c[k] : c[k];
@@ -456,9 +522,14 @@ int recv_response_umad(int which)
 
 int main(int argc, char *argv[])
 {
+  int have_host_args = 0;
+  int have_job_args = 0;
+  int want_expand = 0;
+  char **args = NULL;
+  size_t nr_args = 0;
+
   const char *net_info_path = IBTOP_NET_INFO_PATH;
-  const char *net_disc_cmd = IBTOP_NET_DISC_CMD;
-  FILE *net_info_file = NULL;
+  const char *net_info_cmd = IBTOP_NET_INFO_CMD;
   const char *job_map_path = IBTOP_JOB_MAP_PATH;
   const char *job_map_cmd = IBTOP_JOB_MAP_CMD;
   int job_map_max_age = IBTOP_JOB_MAP_MAX_AGE; /* Use -1 for never. */
@@ -466,39 +537,72 @@ int main(int argc, char *argv[])
   size_t i;
 
   struct option opts[] = {
+    { "help",            0, NULL, 'h' },
     { "interval",        1, NULL, 'i' },
-    { "job-map",         1, NULL, 'j' },
-    { "job-map-cmd",     1, NULL, 'J' },
+    { "job-list",        0, NULL, 'j' },
+    { "host-list",       0, NULL, 'l' },
     { "job-map-max-age", 1, NULL, 'm' },
-    { "net-info",        1, NULL, 'n' },
-    { "net-disc-cmd",    1, NULL, 'N' },
+    { "no-job-map",      0, NULL, 'n' },
+    { "expand",          0, NULL, 'x' },
+    { "job-map",         1, NULL, 257 },
+    { "job-map-cmd",     1, NULL, 258 },
+    { "net-info",        1, NULL, 259 },
+    { "net-info-cmd",    1, NULL, 260 },
     { NULL, 0, NULL, 0},
   };
 
-#define STRN(s) (strcmp((s), "NONE") != 0 ? (s) : NULL)
-
   int c;
-  while ((c = getopt_long(argc, argv, "i:j:J:m:n:N:", opts, 0)) != -1) {
+  while ((c = getopt_long(argc, argv, "hi:jlm:nx", opts, 0)) != -1) {
     switch (c) {
+    case 'h':
+      printf("Usage: %s [OPTION]... [ARGS...]\n"
+             "Report IB load by job or host.\n"
+             "\n"
+             "Mandatory arguments to long options are mandatory for short options too.\n"
+             "  -h, --help                    display this help and exit\n"
+             "  -i, --interval=NUMBER         report load over NUMBER seconds\n"
+             "  -j, --job-list                report load on jobs given as arguments\n"
+             "  -l, --host-list               report load on hosts given as arguments\n"
+             "  -m, --job-map-max-age=NUMBER  regenerate job map if more than NUMBER seconds old\n"
+             "  -n, --no-job-map              do not use a job map\n"
+             "  -x, --expand                  output one line per host\n"
+             "  --job-map=PATH                use job map at PATH\n"
+             "  --job-map-cmd=COMMAND         use COMMAND to generate job map\n"
+             "  --net-info=PATH               use net info at PATH\n"
+             "  --net-info-cmd=COMMAND        use COMMAND to regenerate net info\n",
+             program_invocation_short_name);
+      exit(EXIT_SUCCESS);
     case 'i':
       interval = strtod(optarg, NULL);
       if (interval <= 0)
         FATAL("invalid interval `%s'\n", optarg);
       break;
     case 'j':
-      job_map_path = STRN(optarg);
+      have_job_args = 1;
       break;
-    case 'J':
-      job_map_cmd = STRN(optarg);
+    case 'l':
+      have_host_args = 1;
       break;
     case 'm':
       job_map_max_age = atoi(optarg);
       break;
     case 'n':
+      job_map_path = NULL;
+      break;
+    case 'x':
+      want_expand = 1;
+      break;
+    case 257:
+      job_map_path = optarg;
+      break;
+    case 258:
+      job_map_cmd = optarg;
+      break;
+    case 259:
       net_info_path = optarg;
       break;
-    case 'N':
-      net_disc_cmd = optarg;
+    case 260:
+      net_info_cmd = optarg;
       break;
     case '?':
       fprintf(stderr, "Try `%s --help' for more information.",
@@ -507,20 +611,30 @@ int main(int argc, char *argv[])
     }
   }
 
+  if (have_job_args && have_host_args)
+    FATAL("cannot use `-j, --job-list' and `-l, --host-list' options simultaneously\n");
+
+  args = argv + optind;
+  nr_args = argc - optind;
+
+  host_vec_len = NR_HOSTS_HINT > 0 ? NR_HOSTS_HINT : 4096;
+  host_vec = malloc(host_vec_len * sizeof(host_vec[0]));
+  if (host_vec == NULL)
+    OOM();
+
   if (dict_init(&host_dict, NR_HOSTS_HINT) < 0)
+    OOM();
+
+  job_vec_len = NR_JOBS_HINT > 0 ? NR_JOBS_HINT : 256;
+  job_vec = malloc(job_vec_len * sizeof(job_vec[0]));
+  if (job_vec == NULL)
     OOM();
 
   if (dict_init(&job_dict, NR_JOBS_HINT) < 0)
     OOM();
 
-  net_info_file = fopen(net_info_path, "r");
-  if (net_info_file == NULL)
-    FATAL("cannot open `%s': %m\n", net_info_path);
-
-  if (host_vec_init(net_info_file) < 0)
-    FATAL("failed to initialize host vector\n");
-
-  fclose(net_info_file);
+  if (host_vec_init(net_info_path, net_info_cmd) < 0)
+    /* ... */;
 
   if (nr_hosts == 0)
     FATAL("no valid hosts\n");
@@ -554,10 +668,40 @@ int main(int argc, char *argv[])
 
     start[which] = dnow();
 
-    for (i = 0; i < nr_hosts; i++) {
-      if (host_send_perf_umad(host_vec[i]) < 0)
-        continue;
-      nr_sent++;
+    if (have_host_args) {
+      for (i = 0; i < nr_args; i++) {
+        struct host_ent *h = host_lookup(args[i], 0);
+        if (h == NULL) {
+          if (which == 0)
+            ERROR("unknown host `%s'\n", args[i]);
+          continue;
+        }
+        if (host_send_perf_umad(h) < 0)
+          continue;
+        nr_sent++;
+      }
+    } else if (have_job_args) {
+      for (i = 0; i < nr_args; i++) {
+        struct job_ent *j = job_lookup(args[i], NULL, 0);
+        if (j == NULL) {
+          if (which == 0)
+            ERROR("unknown job `%s'\n", args[i]);
+          continue;
+        }
+
+        struct host_ent *h;
+        list_for_each_entry(h, &j->j_host_list, h_job_link) {
+          if (host_send_perf_umad(h) < 0)
+            continue;
+          nr_sent++;
+        }
+      }
+    } else {
+      for (i = 0; i < nr_hosts; i++) {
+        if (host_send_perf_umad(host_vec[i]) < 0)
+          continue;
+        nr_sent++;
+      }
     }
 
     TRACE("sent %zu in %f seconds\n", nr_sent, dnow() - start[which]);
@@ -581,7 +725,7 @@ int main(int argc, char *argv[])
         break;
       }
 
-      if (recv_response_umad(which, host_vec, nr_hosts) < 0)
+      if (recv_response_umad(which) < 0)
         continue;
 
       nr_responses++;
@@ -602,10 +746,8 @@ int main(int argc, char *argv[])
       TRACE("skipping host `%s', valid %u\n",
             h->h_name, (unsigned int) h->h_valid);
 
-    if (j == NULL) {
+    if (j == NULL)
       j = job_lookup(h->h_name, NULL, 1);
-      j->j_nr_hosts++;
-    }
 
     int k;
     for (k = 0; k < NR_CTRS; k++)
@@ -615,7 +757,7 @@ int main(int argc, char *argv[])
   qsort(job_vec, nr_jobs, sizeof(job_vec[0]), &job_cmp);
 
   /* Omit packet counters for now. */
-  printf("%-12s %12s %12s %8s %-12s\n",
+  printf("%-12s %14s %14s %8s %-12s\n",
          "JOBID", "TX_MB/S", "RX_MB/S", "NR_HOSTS", "OWNER");
 
   for (i = 0; i < nr_jobs; i++) {
@@ -626,9 +768,35 @@ int main(int argc, char *argv[])
     double tx_mbps = j->j_ctrs[C_TX_B] / interval / 1048576;
     /* double tx_ps = j->j_ctrs[C_TX_P] / interval; */
 
-    printf("%-12s %12.3f %12.3f %8zu %-12s\n",
+    if (j->j_nr_hosts == 0) { /* Fake job. */
+      printf("%-12s %14.3f %14.3f\n", j->j_name, tx_mbps, rx_mbps);
+      continue;
+    }
+
+    printf("%-12s %14.3f %14.3f %8zu %-12s\n",
            j->j_name, tx_mbps, rx_mbps, j->j_nr_hosts,
            j->j_owner != NULL ? j->j_owner : "-");
+
+    if (want_expand) {
+      struct host_ent *h, **v;
+      size_t i;
+
+      v = malloc(j->j_nr_hosts * sizeof(v[0]));
+
+      i = 0;
+      list_for_each_entry(h, &j->j_host_list, h_job_link)
+        v[i++] = h;
+
+      qsort(v, j->j_nr_hosts, sizeof(v[0]), &job_cmp); /* XXX */
+
+      for (i = 0; i < j->j_nr_hosts; i++)
+        printf("  %-10s %14.3f %14.3f\n",
+               v[i]->h_name,
+               v[i]->h_ctrs[C_TX_B] / interval / 1048576,
+               v[i]->h_ctrs[C_RX_B] / interval / 1048576);
+
+      free(v);
+    }
   }
 
   if (umad_fd >= 0)
