@@ -20,6 +20,7 @@
 #define NR_JOBS_HINT 256
 #define NR_HOSTS_HINT 4096
 #define TRID_BASE 0xE1F2A3B4C5D6E7F8
+#define P_TRID "%016"PRIx64
 
 /* /sys/class/infiniband/HCA_NAME/ports/HCA_PORT */
 
