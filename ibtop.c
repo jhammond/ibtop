@@ -69,7 +69,7 @@ struct job_ent {
   uint64_t j_ctrs[NR_CTRS];
   char *j_owner;
   struct list_head j_host_list;
-  size_t j_nr_hosts;
+  size_t j_nr_hosts, j_nr_valid;
   char j_name[];
 };
 
@@ -742,12 +742,16 @@ int main(int argc, char *argv[])
     struct host_ent *h = host_vec[i];
     struct job_ent *j = h->h_job;
 
-    if (h->h_valid != 3)
+    if (h->h_valid != 3) {
       TRACE("skipping host `%s', valid %u\n",
             h->h_name, (unsigned int) h->h_valid);
+      continue;
+    }
 
     if (j == NULL)
       j = job_lookup(h->h_name, NULL, 1);
+
+    j->j_nr_valid++;
 
     int k;
     for (k = 0; k < NR_CTRS; k++)
@@ -762,6 +766,9 @@ int main(int argc, char *argv[])
 
   for (i = 0; i < nr_jobs; i++) {
     struct job_ent *j = job_vec[i];
+
+    if (j->j_nr_valid == 0)
+      continue;
 
     double rx_mbps = j->j_ctrs[C_RX_B] / interval / 1048576;
     /* double rx_ps = j->j_ctrs[C_RX_P] / interval; */
