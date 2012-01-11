@@ -200,6 +200,7 @@ int host_vec_init(const char *info_path, const char *info_cmd)
   return rc;
 }
 
+/* XXX Also used to sort hosts. */
 int job_cmp(const void *p1, const void *p2)
 {
   uint64_t *c1 = (*(struct job_ent **) p1)->j_ctrs;
@@ -795,7 +796,8 @@ int main(int argc, char *argv[])
       list_for_each_entry(h, &j->j_host_list, h_job_link)
         v[i++] = h;
 
-      qsort(v, j->j_nr_hosts, sizeof(v[0]), &job_cmp); /* XXX */
+      /* XXX We're sorting hosts using job_cmp(). */
+      qsort(v, j->j_nr_hosts, sizeof(v[0]), &job_cmp);
 
       for (i = 0; i < j->j_nr_hosts; i++)
         printf("  %-10s %14.3f %14.3f\n",
